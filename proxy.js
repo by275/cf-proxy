@@ -1,5 +1,6 @@
 const DEFAULT_CONNECT_TIMEOUT_MS = 10_000;
 const DEFAULT_IDLE_TIMEOUT_MS = 30_000;
+const DEFAULT_WORKER_COOLDOWN_MS = 30_000;
 
 const createRequestId = () => crypto.randomUUID();
 
@@ -116,6 +117,34 @@ const getTimeoutMs = (value, fallback) => {
     return parsed;
 };
 
+const getRetryCount = (value, fallback) => {
+    const parsed = Number(value);
+
+    if (!Number.isInteger(parsed) || parsed < 0)
+        return fallback;
+
+    return parsed;
+};
+
+const getWorkerState = (options, worker) => {
+    options.workerState ||= new Map();
+
+    if (!options.workerState.has(worker))
+        options.workerState.set(worker, { cooldownUntil: 0 });
+
+    return options.workerState.get(worker);
+};
+
+const markWorkerFailure = (options, worker) => {
+    const state = getWorkerState(options, worker);
+    state.cooldownUntil = Date.now() + options.workerCooldownMs;
+};
+
+const markWorkerSuccess = (options, worker) => {
+    const state = getWorkerState(options, worker);
+    state.cooldownUntil = 0;
+};
+
 const clearSocketTimers = (socket) => {
     clearTimeout(socket.connectTimeoutId);
     clearTimeout(socket.idleTimeoutId);
@@ -179,19 +208,79 @@ const sendProxyFailure = (socket, options, statusLine = 'HTTP/1.1 500 Internal S
         socket.write(Buffer.from([0x5, 0x05, 0x00, 0x01, 0x7f, 0x00, 0x00, 0x01, 0x00, 0x00]));
 };
 
-const selectWorker = (options) => {
-    const worker = options.workers[options.workerCursor % options.workers.length];
-    options.workerCursor = (options.workerCursor + 1) % options.workers.length;
-    return worker;
+const selectWorker = (options, excludedWorkers = new Set()) => {
+    const now = Date.now();
+
+    for (let i = 0; i < options.workers.length; i++) {
+        const index = (options.workerCursor + i) % options.workers.length;
+        const worker = options.workers[index];
+        const state = getWorkerState(options, worker);
+
+        if (excludedWorkers.has(worker) || state.cooldownUntil > now)
+            continue;
+
+        options.workerCursor = (index + 1) % options.workers.length;
+        return worker;
+    }
+
+    return null;
 };
 
-const proxyConnect = (target, socket, options) => {
-    socket.requestId = socket.requestId || createRequestId();
-    socket.startedAt = Date.now();
-    socket.target = target;
-    socket.worker = selectWorker(options);
+const maybeRetryConnection = (socket, options, reason, extraFields = {}) => {
+    if (socket.proxyHandshakeSent)
+        return false;
 
-    logEvent(options, socket, 'proxy.connect.start', { target });
+    const retriesUsed = socket.connectAttempt - 1;
+
+    if (retriesUsed >= options.connectRetries) {
+        logEvent(options, socket, 'proxy.error.retry_exhausted', {
+            target: socket.target,
+            reason,
+            attempts: socket.connectAttempt,
+            ...extraFields,
+        });
+        return false;
+    }
+
+    socket.proxy = undefined;
+    clearSocketTimers(socket);
+
+    logEvent(options, socket, 'proxy.error.retry', {
+        target: socket.target,
+        reason,
+        attempt: socket.connectAttempt,
+        nextAttempt: socket.connectAttempt + 1,
+        ...extraFields,
+    });
+
+    startProxyConnection(socket.target, socket, options);
+    return true;
+};
+
+const startProxyConnection = (target, socket, options) => {
+    socket.requestId = socket.requestId || createRequestId();
+    socket.startedAt = socket.startedAt || Date.now();
+    socket.target = target;
+    socket.triedWorkers ||= new Set();
+    socket.connectAttempt = (socket.connectAttempt ?? 0) + 1;
+    socket.worker = selectWorker(options, socket.triedWorkers);
+
+    if (!socket.worker) {
+        logEvent(options, socket, 'proxy.error.no_worker_available', {
+            target,
+            attempts: socket.connectAttempt,
+        });
+        sendProxyFailure(socket, options, 'HTTP/1.1 503 Service Unavailable\r\n\r\n');
+        closeSocketProxy(socket, 'no worker available', options);
+        return null;
+    }
+
+    socket.triedWorkers.add(socket.worker);
+
+    logEvent(options, socket, 'proxy.connect.start', {
+        target,
+        attempt: socket.connectAttempt,
+    });
 
     socket.proxyClosed = false;
     socket.proxyHandshakeSent = false;
@@ -202,53 +291,98 @@ const proxyConnect = (target, socket, options) => {
             'X-Proxy-Target': target,
         }
     });
+    socket.proxy = ws;
 
     socket.connectTimeoutId = setTimeout(() => {
+        if (socket.proxy !== ws)
+            return;
+
+        markWorkerFailure(options, socket.worker);
         logEvent(options, socket, 'proxy.error.connect_timeout', {
             target,
             timeoutMs: options.connectTimeoutMs,
+            attempt: socket.connectAttempt,
         });
-        sendProxyFailure(socket, options, 'HTTP/1.1 504 Gateway Timeout\r\n\r\n');
-        closeSocketProxy(socket, 'worker connect timeout', options);
+
+        if (!maybeRetryConnection(socket, options, 'connect_timeout', { timeoutMs: options.connectTimeoutMs })) {
+            sendProxyFailure(socket, options, 'HTTP/1.1 504 Gateway Timeout\r\n\r\n');
+            closeSocketProxy(socket, 'worker connect timeout', options);
+        }
     }, options.connectTimeoutMs);
 
     ws.onopen = () => {
+        if (socket.proxy !== ws)
+            return;
+
         clearTimeout(socket.connectTimeoutId);
+        markWorkerSuccess(options, socket.worker);
         logEvent(options, socket, 'proxy.connect.open', {
             target,
             durationMs: Date.now() - socket.startedAt,
+            attempt: socket.connectAttempt,
         });
         sendProxyReady(socket, options);
         refreshIdleTimeout(socket, options);
+
+        if (socket.pendingForwardData) {
+            ws.send(socket.pendingForwardData);
+            socket.pendingForwardData = null;
+        }
     };
 
     ws.onerror = () => {
+        if (socket.proxy !== ws)
+            return;
+
+        markWorkerFailure(options, socket.worker);
         logEvent(options, socket, 'proxy.error.websocket', { target });
-        sendProxyFailure(socket, options);
-        closeSocketProxy(socket, 'worker websocket error', options);
+
+        if (!maybeRetryConnection(socket, options, 'websocket_error')) {
+            sendProxyFailure(socket, options);
+            closeSocketProxy(socket, 'worker websocket error', options);
+        }
     };
 
     ws.onclose = (e) => {
+        if (socket.proxy !== ws)
+            return;
+
         clearSocketTimers(socket);
 
         if (e.reason == "Expected 101 status code") {
-            sendProxyFailure(socket, options);
+            markWorkerFailure(options, socket.worker);
             logEvent(options, socket, 'proxy.error.handshake', {
                 target,
                 code: e.code,
                 reason: e.reason,
+                attempt: socket.connectAttempt,
             });
+
+            if (maybeRetryConnection(socket, options, 'handshake_failed', { code: e.code }))
+                return;
+
+            sendProxyFailure(socket, options);
         }
 
         closeSocketProxy(socket, `worker websocket closed (${e.code})`, options);
     };
 
     ws.onmessage = (e) => {
+        if (socket.proxy !== ws)
+            return;
+
         refreshIdleTimeout(socket, options);
         socket.write(e.data);
     };
 
     return ws;
+};
+
+const proxyConnect = (target, socket, options) => {
+    socket.connectAttempt = 0;
+    socket.triedWorkers = new Set();
+    socket.pendingForwardData = null;
+    return startProxyConnection(target, socket, options);
 };
 
 const httpServer = (options) => Bun.listen({
@@ -282,7 +416,7 @@ const httpServer = (options) => Bun.listen({
                 socket.httpBuffer = Buffer.alloc(0);
 
                 if (parsed.forwardData)
-                    socket.proxy.send(parsed.forwardData);
+                    socket.pendingForwardData = parsed.forwardData;
             } else {
                 refreshIdleTimeout(socket, options);
                 socket.proxy.send(data);
@@ -423,6 +557,12 @@ const parseOptions = (argv) => {
             case '--idle-timeout-ms':
                 options.idleTimeoutMs = parseInt(argv[++i]);
                 break;
+            case '--connect-retries':
+                options.connectRetries = parseInt(argv[++i]);
+                break;
+            case '--worker-cooldown-ms':
+                options.workerCooldownMs = parseInt(argv[++i]);
+                break;
             case '--json-log':
                 options.jsonLog = true;
                 break;
@@ -461,11 +601,13 @@ function main() {
 
     options.connectTimeoutMs = getTimeoutMs(options.connectTimeoutMs, DEFAULT_CONNECT_TIMEOUT_MS);
     options.idleTimeoutMs = getTimeoutMs(options.idleTimeoutMs, DEFAULT_IDLE_TIMEOUT_MS);
+    options.workerCooldownMs = getTimeoutMs(options.workerCooldownMs, DEFAULT_WORKER_COOLDOWN_MS);
     options.verbosity = options.verbosity ?? 0;
     options.verbose = options.verbosity > 0;
     options.workers = options.workers?.length ? options.workers : options.worker ? [options.worker] : [];
     options.worker = options.workers[0];
     options.workerCursor = 0;
+    options.connectRetries = getRetryCount(options.connectRetries, Math.max(0, options.workers.length - 1));
 
     if (!options.server || !options.workers.length) {
         console.log('Missing proxy type or worker endpoint');
@@ -483,6 +625,8 @@ function main() {
         console.log('-a, --auth         Authorization header');
         console.log('--connect-timeout-ms  Worker connect timeout in milliseconds (default: 10000)');
         console.log('--idle-timeout-ms     Idle timeout in milliseconds (default: 30000)');
+        console.log('--connect-retries     Retry failed worker connects (default: workers-1)');
+        console.log('--worker-cooldown-ms  Exclude failed workers for this long (default: 30000)');
         console.log('--json-log            Emit logs as JSON instead of human-readable text');
         console.log('-v                    Show connect.open and close logs');
         console.log('-vv, --verbose        Show full connection lifecycle logs');
