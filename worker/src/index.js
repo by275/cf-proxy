@@ -13,6 +13,19 @@ const errorResponse = (status, code, message) => new Response(JSON.stringify({
     },
 });
 
+const createRequestId = () => crypto.randomUUID();
+
+const logEvent = (requestId, event, fields = {}) => {
+    console.log(JSON.stringify({
+        ts: new Date().toISOString(),
+        requestId,
+        event,
+        ...fields,
+    }));
+};
+
+const isVerboseLoggingEnabled = (env) => env.PROXY_VERBOSE_LOGS === '1' || env.PROXY_VERBOSE_LOGS === 'true';
+
 const getJsonObject = (value) => {
     if (!value)
         return {};
@@ -148,30 +161,50 @@ const getTargetPolicy = (env, host) => {
 
 export default {
     async fetch(request, env) {
+        const requestId = createRequestId();
+        const startedAt = Date.now();
         const token = env.PROXY_AUTH_TOKEN;
+        const verboseLogs = isVerboseLoggingEnabled(env);
 
-        if (!token)
+        if (!token) {
+            logEvent(requestId, 'worker.reject', { reason: 'worker_not_configured' });
             return errorResponse(500, 'worker_not_configured', 'Worker is not configured');
+        }
 
-        if (request.headers.get('Authorization') !== token)
+        if (request.headers.get('Authorization') !== token) {
+            logEvent(requestId, 'worker.reject', { reason: 'unauthorized' });
             return errorResponse(401, 'unauthorized', 'Unauthorized');
+        }
 
         const upgradeHeader = request.headers.get('Upgrade');
 
-        if (!upgradeHeader || upgradeHeader !== 'websocket')
+        if (!upgradeHeader || upgradeHeader !== 'websocket') {
+            logEvent(requestId, 'worker.reject', { reason: 'upgrade_required' });
             return errorResponse(426, 'upgrade_required', 'Expected Upgrade: websocket');
+        }
 
         const proxyTarget = request.headers.get('X-Proxy-Target');
         const validation = validateTarget(proxyTarget);
 
-        if (!validation.ok)
+        if (!validation.ok) {
+            logEvent(requestId, 'worker.reject', {
+                reason: 'invalid_target',
+                target: proxyTarget,
+                status: validation.status,
+            });
             return errorResponse(validation.status, 'invalid_target', validation.message);
+        }
 
         const parsedTarget = parseTarget(proxyTarget);
         const policy = getTargetPolicy(env, parsedTarget.host.toLowerCase());
 
-        if (policy.allow === false)
+        if (policy.allow === false) {
+            logEvent(requestId, 'worker.reject', {
+                reason: 'target_blocked_by_policy',
+                target: proxyTarget,
+            });
             return errorResponse(403, 'target_blocked_by_policy', 'Target is blocked by policy');
+        }
 
         const connectTimeoutMs = getTimeoutMs(
             policy.connectTimeoutMs,
@@ -181,6 +214,14 @@ export default {
             policy.idleTimeoutMs,
             getTimeoutMs(env.PROXY_IDLE_TIMEOUT_MS, DEFAULT_IDLE_TIMEOUT_MS)
         );
+
+        if (verboseLogs) {
+            logEvent(requestId, 'worker.accept', {
+                target: proxyTarget,
+                connectTimeoutMs,
+                idleTimeoutMs,
+            });
+        }
 
         try {
             const target = connect(proxyTarget);
@@ -195,6 +236,14 @@ export default {
 
                 closed = true;
                 clearTimeout(idleTimeoutId);
+                if (verboseLogs) {
+                    logEvent(requestId, 'worker.close', {
+                        target: proxyTarget,
+                        code,
+                        reason,
+                        durationMs: Date.now() - startedAt,
+                    });
+                }
 
                 try {
                     await target.close();
@@ -210,6 +259,12 @@ export default {
             };
 
             await withTimeout(target.opened, connectTimeoutMs, () => target.close());
+            if (verboseLogs) {
+                logEvent(requestId, 'upstream.connected', {
+                    target: proxyTarget,
+                    durationMs: Date.now() - startedAt,
+                });
+            }
 
             const writer = target.writable.getWriter();
             const refreshIdleTimeout = () => {
@@ -249,6 +304,12 @@ export default {
             return new Response(null, { status: 101, webSocket: client, });
         } catch (e) {
             const classified = classifyError(e);
+            logEvent(requestId, 'worker.error', {
+                target: proxyTarget,
+                error: classified.code,
+                status: classified.status,
+                durationMs: Date.now() - startedAt,
+            });
             return errorResponse(classified.status, classified.code, classified.message);
         }
     }
