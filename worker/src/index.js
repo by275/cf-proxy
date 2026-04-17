@@ -13,6 +13,18 @@ const errorResponse = (status, code, message) => new Response(JSON.stringify({
     },
 });
 
+const getJsonObject = (value) => {
+    if (!value)
+        return {};
+
+    try {
+        const parsed = JSON.parse(value);
+        return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+    } catch {
+        return {};
+    }
+};
+
 const isPrivateIpv4 = (host) => {
     const parts = host.split('.').map(Number);
 
@@ -123,11 +135,20 @@ const classifyError = (error) => {
     return { status: 500, code: 'internal_error', message: 'Internal worker error' };
 };
 
+const getTargetPolicy = (env, host) => {
+    const policies = getJsonObject(env.PROXY_TARGET_POLICIES);
+    const defaultPolicy = policies['*'];
+    const hostPolicy = policies[host];
+
+    return {
+        ...(defaultPolicy && typeof defaultPolicy === 'object' ? defaultPolicy : {}),
+        ...(hostPolicy && typeof hostPolicy === 'object' ? hostPolicy : {}),
+    };
+};
+
 export default {
     async fetch(request, env) {
         const token = env.PROXY_AUTH_TOKEN;
-        const connectTimeoutMs = getTimeoutMs(env.PROXY_CONNECT_TIMEOUT_MS, DEFAULT_CONNECT_TIMEOUT_MS);
-        const idleTimeoutMs = getTimeoutMs(env.PROXY_IDLE_TIMEOUT_MS, DEFAULT_IDLE_TIMEOUT_MS);
 
         if (!token)
             return errorResponse(500, 'worker_not_configured', 'Worker is not configured');
@@ -145,6 +166,21 @@ export default {
 
         if (!validation.ok)
             return errorResponse(validation.status, 'invalid_target', validation.message);
+
+        const parsedTarget = parseTarget(proxyTarget);
+        const policy = getTargetPolicy(env, parsedTarget.host.toLowerCase());
+
+        if (policy.allow === false)
+            return errorResponse(403, 'target_blocked_by_policy', 'Target is blocked by policy');
+
+        const connectTimeoutMs = getTimeoutMs(
+            policy.connectTimeoutMs,
+            getTimeoutMs(env.PROXY_CONNECT_TIMEOUT_MS, DEFAULT_CONNECT_TIMEOUT_MS)
+        );
+        const idleTimeoutMs = getTimeoutMs(
+            policy.idleTimeoutMs,
+            getTimeoutMs(env.PROXY_IDLE_TIMEOUT_MS, DEFAULT_IDLE_TIMEOUT_MS)
+        );
 
         try {
             const target = connect(proxyTarget);
