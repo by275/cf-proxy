@@ -148,6 +148,31 @@ const classifyError = (error) => {
     return { status: 500, code: 'internal_error', message: 'Internal worker error' };
 };
 
+const ignorePromise = (promise) => {
+    Promise.resolve(promise).catch(() => {
+        // ignore cleanup errors
+    });
+};
+
+const toUint8Array = async (value) => {
+    if (value instanceof Uint8Array)
+        return value;
+
+    if (value instanceof ArrayBuffer)
+        return new Uint8Array(value);
+
+    if (ArrayBuffer.isView(value))
+        return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+
+    if (typeof Blob !== 'undefined' && value instanceof Blob)
+        return new Uint8Array(await value.arrayBuffer());
+
+    if (typeof value === 'string')
+        return new TextEncoder().encode(value);
+
+    return new TextEncoder().encode(String(value ?? ''));
+};
+
 const getTargetPolicy = (env, host) => {
     const policies = getJsonObject(env.PROXY_TARGET_POLICIES);
     const defaultPolicy = policies['*'];
@@ -229,13 +254,18 @@ export default {
             const [client, server] = Object.values(websocket);
             let idleTimeoutId;
             let closed = false;
+            let writer;
+            let reader;
+            let removeServerListeners;
+            let writeChain = Promise.resolve();
 
-            const closeEverything = async (code = 1011, reason = 'Proxy closed') => {
+            const closeEverything = (code = 1011, reason = 'Proxy closed') => {
                 if (closed)
                     return;
 
                 closed = true;
                 clearTimeout(idleTimeoutId);
+                removeServerListeners?.();
                 if (verboseLogs) {
                     logEvent(requestId, 'worker.close', {
                         target: proxyTarget,
@@ -246,10 +276,19 @@ export default {
                 }
 
                 try {
-                    await target.close();
+                    writer?.releaseLock();
                 } catch {
                     // ignore close errors
                 }
+
+                try {
+                    reader?.releaseLock();
+                } catch {
+                    // ignore release errors
+                }
+
+                ignorePromise(reader?.cancel(reason));
+                ignorePromise(target.close());
 
                 try {
                     server.close(code, reason);
@@ -266,7 +305,9 @@ export default {
                 });
             }
 
-            const writer = target.writable.getWriter();
+            writer = target.writable.getWriter();
+            reader = target.readable.getReader();
+
             const refreshIdleTimeout = () => {
                 clearTimeout(idleTimeoutId);
                 idleTimeoutId = setTimeout(() => {
@@ -277,29 +318,47 @@ export default {
             server.accept();
             refreshIdleTimeout();
 
-            server.addEventListener('message', event => {
+            const onServerMessage = (event) => {
+                if (closed)
+                    return;
+
                 refreshIdleTimeout();
-                writer.write(event.data).catch(() => closeEverything(1011, 'Upstream write failed'));
-            });
-            server.addEventListener('close', () => closeEverything(1000, 'Client closed'));
-            server.addEventListener('error', () => closeEverything(1011, 'Client websocket error'));
+                writeChain = writeChain
+                    .then(async () => writer.write(await toUint8Array(event.data)))
+                    .catch(() => closeEverything(1011, 'Upstream write failed'));
+            };
+            const onServerClose = () => closeEverything(1000, 'Client closed');
+            const onServerError = () => closeEverything(1011, 'Client websocket error');
 
-            target.readable.pipeTo(new WritableStream({
-                write(chunk) {
+            server.addEventListener('message', onServerMessage);
+            server.addEventListener('close', onServerClose);
+            server.addEventListener('error', onServerError);
+            removeServerListeners = () => {
+                server.removeEventListener('message', onServerMessage);
+                server.removeEventListener('close', onServerClose);
+                server.removeEventListener('error', onServerError);
+            };
+
+            const readLoop = async () => {
+                while (!closed) {
+                    const { done, value } = await reader.read();
+
+                    if (done) {
+                        closeEverything(1000, 'Upstream closed');
+                        return;
+                    }
+
                     refreshIdleTimeout();
-                    server.send(chunk);
-                },
-                close() {
-                    closeEverything(1000, 'Upstream closed');
-                },
-                abort() {
-                    closeEverything(1011, 'Upstream aborted');
-                },
-            })).catch(() => closeEverything(1011, 'Upstream read failed'));
+                    server.send(value);
+                }
+            };
 
-            target.closed
-                .catch(() => closeEverything(1011, 'Upstream socket error'))
-                .finally(() => closeEverything(1000, 'Upstream socket closed'));
+            readLoop().catch((error) => {
+                if (closed)
+                    return;
+
+                closeEverything(1011, 'Upstream read failed');
+            });
 
             return new Response(null, { status: 101, webSocket: client, });
         } catch (e) {
