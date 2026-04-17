@@ -5,6 +5,7 @@ const DEFAULT_IDLE_TIMEOUT_MS = 30_000;
 const DEFAULT_WORKER_COOLDOWN_MS = 30_000;
 const DEFAULT_MAX_CONNECTIONS_PER_WORKER = 32;
 const DEFAULT_MAX_PENDING_BYTES = 1024 * 1024;
+const HTTP_RETRYABLE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 
 const createRequestId = () => crypto.randomUUID();
 
@@ -35,7 +36,7 @@ const formatTextLog = (level, event, fields) => {
         `target=${fields.target ?? '-'}`,
     ];
     const extras = Object.entries(fields)
-        .filter(([key, value]) => !['ts', 'req', 'worker', 'target'].includes(key) && value !== undefined)
+        .filter(([key, value]) => !['ts', 'req', 'event', 'worker', 'target'].includes(key) && value !== undefined)
         .map(([key, value]) => `${key}=${value}`);
 
     return [...parts, ...extras].join(' ');
@@ -81,6 +82,32 @@ const logEvent = (options, socket, event, fields = {}) => {
     console.log(formatTextLog(level, event.replace(/^proxy\./, ''), payload));
 };
 
+const normalizeRelayTarget = (hostHeader, requestTarget) => {
+    const rawHost = hostHeader?.trim();
+
+    if (requestTarget?.startsWith('http://')) {
+        try {
+            const url = new URL(requestTarget);
+            return {
+                target: `${url.hostname}:${url.port || '80'}`,
+                path: `${url.pathname || '/'}${url.search}`,
+            };
+        } catch {
+            // ignore invalid absolute URL
+        }
+    }
+
+    if (!rawHost)
+        return null;
+
+    const parsedHost = parseTargetAddress(rawHost);
+
+    if (parsedHost)
+        return { target: rawHost, path: requestTarget || '/' };
+
+    return { target: `${rawHost}:80`, path: requestTarget || '/' };
+};
+
 const parseHttpRequest = (data) => {
     try {
         const text = Buffer.from(data).toString('latin1');
@@ -92,26 +119,53 @@ const parseHttpRequest = (data) => {
         const headerText = text.slice(0, headerEnd);
         const lines = headerText.split('\r\n');
         const requestLine = lines[0] ?? '';
-        const [method, requestTarget] = requestLine.split(' ');
+        const [method, requestTarget, version = 'HTTP/1.1'] = requestLine.split(' ');
 
         if (method === 'CONNECT' && requestTarget)
-            return { complete: true, target: requestTarget.trim(), forwardData: null };
+            return {
+                complete: true,
+                method,
+                target: requestTarget.trim(),
+                flowKind: 'connect-tunnel',
+                forwardData: null,
+            };
 
         const hostLine = lines.find(line => line.toLowerCase().startsWith('host: '));
 
         if (!hostLine)
-            return { complete: true, target: '', forwardData: null };
+            return { complete: true, method, target: '', flowKind: 'http-relay', forwardData: null };
+
+        const hostHeader = hostLine.split(': ').slice(1).join(': ').trim();
+        const relayTarget = normalizeRelayTarget(hostHeader, requestTarget);
+
+        if (!relayTarget)
+            return { complete: true, method, target: '', flowKind: 'http-relay', forwardData: null };
+
+        const rewrittenLines = [...lines];
+        rewrittenLines[0] = `${method} ${relayTarget.path} ${version}`;
+
+        for (let i = rewrittenLines.length - 1; i >= 1; i--) {
+            const lower = rewrittenLines[i].toLowerCase();
+
+            if (lower.startsWith('proxy-connection:') || lower.startsWith('proxy-authorization:'))
+                rewrittenLines.splice(i, 1);
+        }
+
+        const rewrittenHeader = `${rewrittenLines.join('\r\n')}\r\n\r\n`;
+        const body = Buffer.from(data).subarray(headerEnd + 4);
 
         return {
             complete: true,
-            target: hostLine.split(': ').slice(1).join(': ').trim(),
-            forwardData: Buffer.from(data),
+            method,
+            target: relayTarget.target,
+            flowKind: 'http-relay',
+            forwardData: Buffer.concat([Buffer.from(rewrittenHeader, 'latin1'), body]),
         };
     } catch (e) {
         // log
     }
 
-    return { complete: true, target: '', forwardData: null };
+    return { complete: true, target: '', flowKind: 'http-relay', forwardData: null };
 };
 
 const parseTargetAddress = (target) => {
@@ -293,6 +347,17 @@ const clearSocketTimers = (socket) => {
     socket.idleTimeoutId = undefined;
 };
 
+const getSocketFlowKind = (socket, options) => {
+    if (socket.flowKind)
+        return socket.flowKind;
+
+    return options.type === 'SOCKS5' ? 'socks-tunnel' : 'http-relay';
+};
+
+const isTunnelFlow = (socket, options) => getSocketFlowKind(socket, options) !== 'http-relay';
+const hasProxySessionStarted = (socket, options) => isTunnelFlow(socket, options) ? socket.proxyHandshakeSent : socket.upstreamStarted;
+const canRetryRequest = (socket, options) => isTunnelFlow(socket, options) || socket.retryable !== false;
+
 const sendUpstream = (socket, data) => {
     if (!socket.proxy)
         return;
@@ -393,6 +458,9 @@ const sendProxyReady = (socket, options) => {
     if (socket.proxyHandshakeSent)
         return;
 
+    if (!isTunnelFlow(socket, options))
+        return;
+
     socket.proxyHandshakeSent = true;
 
     if (options.type == 'HTTP')
@@ -402,10 +470,13 @@ const sendProxyReady = (socket, options) => {
 };
 
 const sendProxyFailure = (socket, options, statusLine = 'HTTP/1.1 500 Internal Server Error\r\n\r\n') => {
-    if (socket.proxyHandshakeSent)
+    if (hasProxySessionStarted(socket, options))
         return;
 
-    socket.proxyHandshakeSent = true;
+    if (isTunnelFlow(socket, options))
+        socket.proxyHandshakeSent = true;
+    else
+        socket.upstreamStarted = true;
 
     if (options.type == 'HTTP')
         socket.write(statusLine);
@@ -436,7 +507,7 @@ const selectWorker = (options, excludedWorkers = new Set(), preferredWorkers = [
 };
 
 const maybeRetryConnection = (socket, options, reason, extraFields = {}) => {
-    if (socket.proxyHandshakeSent || socket.routingMode !== 'worker')
+    if (hasProxySessionStarted(socket, options) || socket.routingMode !== 'worker' || !canRetryRequest(socket, options))
         return false;
 
     const retriesUsed = socket.connectAttempt - 1;
@@ -470,7 +541,7 @@ const maybeRetryConnection = (socket, options, reason, extraFields = {}) => {
 };
 
 const maybeFallbackConnection = (socket, options, reason, extraFields = {}) => {
-    if (socket.proxyHandshakeSent)
+    if (hasProxySessionStarted(socket, options))
         return false;
 
     const fallback = socket.routingPolicy?.fallback;
@@ -598,6 +669,7 @@ const startProxyConnection = async (target, socket, options) => {
             target,
             durationMs: Date.now() - socket.startedAt,
             attempt: socket.connectAttempt,
+            flow: getSocketFlowKind(socket, options),
         });
         sendProxyReady(socket, options);
         refreshIdleTimeout(socket, options);
@@ -658,6 +730,7 @@ const startProxyConnection = async (target, socket, options) => {
             return;
 
         refreshIdleTimeout(socket, options);
+        socket.upstreamStarted = true;
         socket.write(e.data);
     };
 
@@ -700,6 +773,7 @@ const startDirectConnection = async (target, socket, options) => {
                         target,
                         durationMs: Date.now() - socket.startedAt,
                         mode: 'direct',
+                        flow: getSocketFlowKind(socket, options),
                     });
                     sendProxyReady(socket, options);
                     refreshIdleTimeout(socket, options);
@@ -716,6 +790,7 @@ const startDirectConnection = async (target, socket, options) => {
                         return;
 
                     refreshIdleTimeout(socket, options);
+                    socket.upstreamStarted = true;
                     socket.write(data);
                 },
                 close(connection) {
@@ -817,6 +892,9 @@ const proxyConnect = (target, socket, options) => {
     socket.pendingForwardData = null;
     socket.pendingClientData = [];
     socket.pendingClientBytes = 0;
+    socket.proxyHandshakeSent = false;
+    socket.upstreamStarted = false;
+    socket.retryable = socket.method ? HTTP_RETRYABLE_METHODS.has(socket.method) : true;
 
     if (socket.routingPolicy.mode === 'direct') {
         startDirectConnection(target, socket, options);
@@ -834,6 +912,9 @@ const initializeSocket = (socket, options, extra = {}) => {
     socket.pendingClientData = [];
     socket.pendingClientBytes = 0;
     socket.httpBuffer = Buffer.alloc(0);
+    socket.flowKind = options.type === 'SOCKS5' ? 'socks-tunnel' : 'http-relay';
+    socket.upstreamStarted = false;
+    socket.proxyHandshakeSent = false;
     Object.assign(socket, extra);
 
     if (options.shuttingDown)
@@ -869,6 +950,9 @@ const httpServer = (options) => Bun.listen({
                     socket.shutdown();
                     return;
                 }
+
+                socket.method = parsed.method;
+                socket.flowKind = parsed.flowKind;
 
                 if (parsed.forwardData)
                     socket.pendingForwardData = parsed.forwardData;
@@ -980,6 +1064,8 @@ const socks5Server = (options) => Bun.listen({
 
                     const port = data.at(-1) + data.at(-2) * 256;
                     target = `${target}:${port}`;
+                    socket.method = 'CONNECT';
+                    socket.flowKind = 'socks-tunnel';
                     proxyConnect(target, socket, options);
 
                     break;
@@ -1130,6 +1216,8 @@ function main() {
 
     const server = options.server(options);
     console.log(`[+] ${options.type} proxy server listening on ${server.hostname}:${server.port} using ${options.workers.length} worker(s)`);
+    if (options.type === 'SOCKS5')
+        console.log('[!] SOCKS5 mode is experimental and not the primary path for this project');
 
     const shutdown = (signal) => {
         if (options.shuttingDown)
