@@ -51,6 +51,19 @@ const getEventVerbosity = (event) => {
     return 2;
 };
 
+const shouldPrintCloseReason = (reason = '') => {
+    if (!reason)
+        return false;
+
+    if (reason === 'client socket closed' || reason === 'Client closed')
+        return false;
+
+    if (reason.startsWith('shutdown '))
+        return false;
+
+    return true;
+};
+
 const logEvent = (options, socket, event, fields = {}) => {
     const payload = {
         ts: formatTimestamp(),
@@ -340,7 +353,7 @@ const closeSocketProxy = (socket, reason, options) => {
         durationMs: socket.startedAt ? Date.now() - socket.startedAt : undefined,
     });
 
-    if (options.verbose && reason)
+    if (options.verbose && shouldPrintCloseReason(reason))
         console.log(`[!] Closing ${options.type} proxy connection: ${reason}`);
 
     closeUpstream(socket);
