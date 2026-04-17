@@ -1,5 +1,8 @@
 import { connect } from 'cloudflare:sockets';
 
+const DEFAULT_CONNECT_TIMEOUT_MS = 10_000;
+const DEFAULT_IDLE_TIMEOUT_MS = 30_000;
+
 const isPrivateIpv4 = (host) => {
     const parts = host.split('.').map(Number);
 
@@ -66,9 +69,43 @@ const validateTarget = (value) => {
     return { ok: true };
 };
 
+const getTimeoutMs = (value, fallback) => {
+    const parsed = Number(value);
+
+    if (!Number.isFinite(parsed) || parsed <= 0)
+        return fallback;
+
+    return parsed;
+};
+
+const withTimeout = async (promise, timeoutMs, onTimeout) => {
+    let timeoutId;
+
+    try {
+        return await Promise.race([
+            promise,
+            new Promise((_, reject) => {
+                timeoutId = setTimeout(async () => {
+                    try {
+                        await onTimeout();
+                    } catch {
+                        // ignore cleanup errors
+                    }
+
+                    reject(new Error('Timed out'));
+                }, timeoutMs);
+            }),
+        ]);
+    } finally {
+        clearTimeout(timeoutId);
+    }
+};
+
 export default {
     async fetch(request, env) {
         const token = env.PROXY_AUTH_TOKEN;
+        const connectTimeoutMs = getTimeoutMs(env.PROXY_CONNECT_TIMEOUT_MS, DEFAULT_CONNECT_TIMEOUT_MS);
+        const idleTimeoutMs = getTimeoutMs(env.PROXY_IDLE_TIMEOUT_MS, DEFAULT_IDLE_TIMEOUT_MS);
 
         if (!token)
             return new Response('Worker is not configured', { status: 500 });
@@ -89,21 +126,73 @@ export default {
 
         try {
             const target = connect(proxyTarget);
-            const writer = target.writable.getWriter();
             const websocket = new WebSocketPair();
             const [client, server] = Object.values(websocket);
+            let idleTimeoutId;
+            let closed = false;
+
+            const closeEverything = async (code = 1011, reason = 'Proxy closed') => {
+                if (closed)
+                    return;
+
+                closed = true;
+                clearTimeout(idleTimeoutId);
+
+                try {
+                    await target.close();
+                } catch {
+                    // ignore close errors
+                }
+
+                try {
+                    server.close(code, reason);
+                } catch {
+                    // ignore close errors
+                }
+            };
+
+            await withTimeout(target.opened, connectTimeoutMs, () => target.close());
+
+            const writer = target.writable.getWriter();
+            const refreshIdleTimeout = () => {
+                clearTimeout(idleTimeoutId);
+                idleTimeoutId = setTimeout(() => {
+                    closeEverything(1011, 'Idle timeout');
+                }, idleTimeoutMs);
+            };
 
             server.accept();
-            server.addEventListener('message', e => writer.write(e.data));
+            refreshIdleTimeout();
+
+            server.addEventListener('message', event => {
+                refreshIdleTimeout();
+                writer.write(event.data).catch(() => closeEverything(1011, 'Upstream write failed'));
+            });
+            server.addEventListener('close', () => closeEverything(1000, 'Client closed'));
+            server.addEventListener('error', () => closeEverything(1011, 'Client websocket error'));
 
             target.readable.pipeTo(new WritableStream({
                 write(chunk) {
+                    refreshIdleTimeout();
                     server.send(chunk);
                 },
-            }));
+                close() {
+                    closeEverything(1000, 'Upstream closed');
+                },
+                abort() {
+                    closeEverything(1011, 'Upstream aborted');
+                },
+            })).catch(() => closeEverything(1011, 'Upstream read failed'));
+
+            target.closed
+                .catch(() => closeEverything(1011, 'Upstream socket error'))
+                .finally(() => closeEverything(1000, 'Upstream socket closed'));
 
             return new Response(null, { status: 101, webSocket: client, });
         } catch (e) {
+            if (e instanceof Error && e.message === 'Timed out')
+                return new Response('Upstream connect timeout', { status: 504 });
+
             return new Response(e, { status: 500 });
         }
     }
