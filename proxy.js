@@ -1,3 +1,6 @@
+const DEFAULT_CONNECT_TIMEOUT_MS = 10_000;
+const DEFAULT_IDLE_TIMEOUT_MS = 30_000;
+
 const parseTarget = (data) => {
     try {
         return String(data).toLowerCase().split('\n')
@@ -10,9 +13,78 @@ const parseTarget = (data) => {
     return '';
 };
 
+const getTimeoutMs = (value, fallback) => {
+    const parsed = Number(value);
+
+    if (!Number.isFinite(parsed) || parsed <= 0)
+        return fallback;
+
+    return parsed;
+};
+
+const clearSocketTimers = (socket) => {
+    clearTimeout(socket.connectTimeoutId);
+    clearTimeout(socket.idleTimeoutId);
+    socket.connectTimeoutId = undefined;
+    socket.idleTimeoutId = undefined;
+};
+
+const closeSocketProxy = (socket, reason, options) => {
+    if (socket.proxyClosed)
+        return;
+
+    socket.proxyClosed = true;
+    clearSocketTimers(socket);
+
+    if (options.verbose && reason)
+        console.log(`[!] Closing ${options.type} proxy connection: ${reason}`);
+
+    try {
+        socket.proxy?.close();
+    } catch {
+        // ignore close errors
+    }
+
+    socket.shutdown();
+};
+
+const refreshIdleTimeout = (socket, options) => {
+    clearTimeout(socket.idleTimeoutId);
+    socket.idleTimeoutId = setTimeout(() => {
+        closeSocketProxy(socket, `idle timeout after ${options.idleTimeoutMs}ms`, options);
+    }, options.idleTimeoutMs);
+};
+
+const sendProxyReady = (socket, options) => {
+    if (socket.proxyHandshakeSent)
+        return;
+
+    socket.proxyHandshakeSent = true;
+
+    if (options.type == 'HTTP')
+        socket.write('HTTP/1.1 200 OK\r\n\r\n');
+    else
+        socket.write(Buffer.from([0x5, 0x00, 0x00, 0x01, 0x7f, 0x00, 0x00, 0x01, 0x00, 0x00]));
+};
+
+const sendProxyFailure = (socket, options, statusLine = 'HTTP/1.1 500 Internal Server Error\r\n\r\n') => {
+    if (socket.proxyHandshakeSent)
+        return;
+
+    socket.proxyHandshakeSent = true;
+
+    if (options.type == 'HTTP')
+        socket.write(statusLine);
+    else
+        socket.write(Buffer.from([0x5, 0x05, 0x00, 0x01, 0x7f, 0x00, 0x00, 0x01, 0x00, 0x00]));
+};
+
 const proxyConnect = (target, socket, options) => {
     if (options.verbose)
         console.log(`[+] Proxying connection to ${target} via ${options.worker}`);
+
+    socket.proxyClosed = false;
+    socket.proxyHandshakeSent = false;
 
     const ws = new WebSocket(`wss://${options.worker}`, {
         headers: {
@@ -21,28 +93,37 @@ const proxyConnect = (target, socket, options) => {
         }
     });
 
-    ws.onopen = (e) => {
-        if (options.type == 'HTTP')
-            socket.write('HTTP/1.1 200 OK\r\n\r\n');
-        else
-            socket.write(Buffer.from([0x5, 0x00, 0x00, 0x01, 0x7f, 0x00, 0x00, 0x01, 0x00, 0x00]));
-    }
+    socket.connectTimeoutId = setTimeout(() => {
+        if (options.verbose)
+            console.log(`[!] Worker connect timeout after ${options.connectTimeoutMs}ms`);
+        sendProxyFailure(socket, options, 'HTTP/1.1 504 Gateway Timeout\r\n\r\n');
+        closeSocketProxy(socket, 'worker connect timeout', options);
+    }, options.connectTimeoutMs);
 
-    ws.onerror = (e) => socket.shutdown();
+    ws.onopen = () => {
+        clearTimeout(socket.connectTimeoutId);
+        sendProxyReady(socket, options);
+        refreshIdleTimeout(socket, options);
+    };
+
+    ws.onerror = () => {
+        sendProxyFailure(socket, options);
+        closeSocketProxy(socket, 'worker websocket error', options);
+    };
 
     ws.onclose = (e) => {
+        clearSocketTimers(socket);
+
         if (e.reason == "Expected 101 status code") {
-            if (options.type == 'HTTP')
-                socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n');
-            else
-                socket.write(Buffer.from([0x5, 0x05, 0x00, 0x01, 0x7f, 0x00, 0x00, 0x01, 0x00, 0x00]));
+            sendProxyFailure(socket, options);
             if (options.verbose) console.log('[!] Worker connection failed!');
         }
 
-        socket.shutdown();
+        closeSocketProxy(socket, `worker websocket closed (${e.code})`, options);
     };
 
     ws.onmessage = (e) => {
+        refreshIdleTimeout(socket, options);
         socket.write(e.data);
     };
 
@@ -58,8 +139,12 @@ const httpServer = (options) => Bun.listen({
                 const target = parseTarget(data);
                 socket.proxy = proxyConnect(target, socket, options);
             } else {
+                refreshIdleTimeout(socket, options);
                 socket.proxy.send(data);
             }
+        },
+        async close(socket) {
+            closeSocketProxy(socket, 'client socket closed', options);
         }
     }
 });
@@ -73,6 +158,7 @@ const socks5Server = (options) => Bun.listen({
         },
         async data(socket, data) {
             if (socket.proxy) {
+                refreshIdleTimeout(socket, options);
                 socket.proxy.send(data);
                 return;
             }
@@ -143,6 +229,9 @@ const socks5Server = (options) => Bun.listen({
 
                     break;
             }
+        },
+        async close(socket) {
+            closeSocketProxy(socket, 'client socket closed', options);
         }
     }
 });
@@ -173,6 +262,12 @@ const parseOptions = (argv) => {
             case '--auth':
                 options.authorization = argv[++i];
                 break;
+            case '--connect-timeout-ms':
+                options.connectTimeoutMs = parseInt(argv[++i]);
+                break;
+            case '--idle-timeout-ms':
+                options.idleTimeoutMs = parseInt(argv[++i]);
+                break;
             case 'socks':
                 options.type = 'SOCKS5';
                 options.server = socks5Server;
@@ -199,6 +294,9 @@ function main() {
 
     if (!options) return -1;
 
+    options.connectTimeoutMs = getTimeoutMs(options.connectTimeoutMs, DEFAULT_CONNECT_TIMEOUT_MS);
+    options.idleTimeoutMs = getTimeoutMs(options.idleTimeoutMs, DEFAULT_IDLE_TIMEOUT_MS);
+
     if (options.help) {
         console.log(`${import.meta.file} - Proxy requests through CloudFlare workers`);
         console.log(`Usage: bun ${import.meta.file} [options] <socks|http> <worker>`);
@@ -208,6 +306,8 @@ function main() {
         console.log('-h, --help         Show this help message and exit');
         console.log('-p, --port         Port to listen on (defaults to 1080 for socks and 8080 for http)');
         console.log('-a, --auth         Authorization header');
+        console.log('--connect-timeout-ms  Worker connect timeout in milliseconds (default: 10000)');
+        console.log('--idle-timeout-ms     Idle timeout in milliseconds (default: 30000)');
         console.log('-v, --verbose      Enable verbose mode (default: false)');
         console.log('')
         console.log(`Example: bun ${import.meta.file} -v -a auth-secret socks my-instance.workers.dev`);
