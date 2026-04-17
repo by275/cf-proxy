@@ -99,7 +99,6 @@ const parseHttpRequest = (data) => {
                 complete: true,
                 method,
                 target: requestTarget.trim(),
-                flowKind: 'http-connect',
                 forwardData: null,
             };
 
@@ -107,15 +106,14 @@ const parseHttpRequest = (data) => {
             complete: true,
             method,
             target: '',
-            flowKind: 'http-connect',
             forwardData: null,
             unsupportedMethod: true,
         };
-    } catch (e) {
+    } catch {
         // log
     }
 
-    return { complete: true, target: '', flowKind: 'http-connect', forwardData: null };
+    return { complete: true, target: '', forwardData: null };
 };
 
 
@@ -296,13 +294,6 @@ const clearSocketTimers = (socket) => {
     clearTimeout(socket.idleTimeoutId);
     socket.connectTimeoutId = undefined;
     socket.idleTimeoutId = undefined;
-};
-
-const getSocketFlowKind = (socket, options) => {
-    if (socket.flowKind)
-        return socket.flowKind;
-
-    return options.type === 'SOCKS5' ? 'socks-tunnel' : 'http-connect';
 };
 
 const sendUpstream = (socket, data) => {
@@ -610,7 +601,6 @@ const startProxyConnection = async (target, socket, options) => {
             target,
             durationMs: Date.now() - socket.startedAt,
             attempt: socket.connectAttempt,
-            flow: getSocketFlowKind(socket, options),
         });
         sendProxyReady(socket, options);
         refreshIdleTimeout(socket, options);
@@ -713,7 +703,6 @@ const startDirectConnection = async (target, socket, options) => {
                         target,
                         durationMs: Date.now() - socket.startedAt,
                         mode: 'direct',
-                        flow: getSocketFlowKind(socket, options),
                     });
                     sendProxyReady(socket, options);
                     refreshIdleTimeout(socket, options);
@@ -849,7 +838,6 @@ const initializeSocket = (socket, options, extra = {}) => {
     socket.pendingClientData = [];
     socket.pendingClientBytes = 0;
     socket.httpBuffer = Buffer.alloc(0);
-    socket.flowKind = options.type === 'SOCKS5' ? 'socks-tunnel' : 'http-connect';
     socket.proxyHandshakeSent = false;
     Object.assign(socket, extra);
 
@@ -896,9 +884,6 @@ const httpServer = (options) => Bun.listen({
                     socket.shutdown();
                     return;
                 }
-
-                socket.method = parsed.method;
-                socket.flowKind = parsed.flowKind;
 
                 if (parsed.forwardData)
                     socket.pendingForwardData = parsed.forwardData;
@@ -1010,8 +995,6 @@ const socks5Server = (options) => Bun.listen({
 
                     const port = data.at(-1) + data.at(-2) * 256;
                     target = `${target}:${port}`;
-                    socket.method = 'CONNECT';
-                    socket.flowKind = 'socks-tunnel';
                     proxyConnect(target, socket, options);
 
                     break;
