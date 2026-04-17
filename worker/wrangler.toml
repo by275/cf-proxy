@@ -1,3 +1,12 @@
-name = "test"
+name = "cf-proxy"
 main = "src/index.js"
 compatibility_date = "2024-01-03"
+
+# Set with:
+# wrangler secret put PROXY_AUTH_TOKEN
+#
+# Optional vars:
+# PROXY_CONNECT_TIMEOUT_MS=10000
+# PROXY_IDLE_TIMEOUT_MS=30000
+# PROXY_VERBOSE_LOGS=true
+# PROXY_TARGET_POLICIES={"*":{"idleTimeoutMs":30000},"example.com":{"idleTimeoutMs":60000},"blocked.example":{"allow":false}}
