@@ -1,6 +1,72 @@
 const DEFAULT_CONNECT_TIMEOUT_MS = 10_000;
 const DEFAULT_IDLE_TIMEOUT_MS = 30_000;
 
+const createRequestId = () => crypto.randomUUID();
+
+const formatTimestamp = (date = new Date()) => {
+    const pad = (value) => String(value).padStart(2, '0');
+
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+};
+
+const shortenRequestId = (requestId) => requestId ? requestId.slice(0, 8) : '--------';
+
+const formatTextLog = (level, event, fields) => {
+    const parts = [
+        `[${level}]`,
+        fields.ts,
+        fields.req,
+        event.padEnd(15, ' '),
+        `worker=${fields.worker ?? '-'}`,
+        `target=${fields.target ?? '-'}`,
+    ];
+    const extras = Object.entries(fields)
+        .filter(([key, value]) => !['ts', 'req', 'worker', 'target'].includes(key) && value !== undefined)
+        .map(([key, value]) => `${key}=${value}`);
+
+    return [...parts, ...extras].join(' ');
+};
+
+const getEventVerbosity = (event) => {
+    if (event.startsWith('proxy.error') || event.startsWith('proxy.reject'))
+        return 0;
+
+    if (event === 'proxy.connect.open' || event === 'proxy.close')
+        return 1;
+
+    return 2;
+};
+
+const logEvent = (options, socket, event, fields = {}) => {
+    const payload = {
+        ts: formatTimestamp(),
+        req: shortenRequestId(socket.requestId),
+        event,
+        worker: options.worker,
+        target: socket.target,
+        ...fields,
+    };
+
+    if ((options.verbosity ?? 0) < getEventVerbosity(event))
+        return;
+
+    const level = fields.level ?? (event.startsWith('proxy.error')
+        ? 'ERR'
+        : event.startsWith('proxy.reject')
+            ? 'WRN'
+            : 'INF');
+
+    if (options.jsonLog) {
+        console.log(JSON.stringify({
+            level,
+            ...payload,
+        }));
+        return;
+    }
+
+    console.log(formatTextLog(level, event.replace(/^proxy\./, ''), payload));
+};
+
 const parseTarget = (data) => {
     try {
         return String(data).toLowerCase().split('\n')
@@ -35,6 +101,12 @@ const closeSocketProxy = (socket, reason, options) => {
 
     socket.proxyClosed = true;
     clearSocketTimers(socket);
+
+    logEvent(options, socket, 'proxy.close', {
+        target: socket.target,
+        reason,
+        durationMs: socket.startedAt ? Date.now() - socket.startedAt : undefined,
+    });
 
     if (options.verbose && reason)
         console.log(`[!] Closing ${options.type} proxy connection: ${reason}`);
@@ -80,8 +152,11 @@ const sendProxyFailure = (socket, options, statusLine = 'HTTP/1.1 500 Internal S
 };
 
 const proxyConnect = (target, socket, options) => {
-    if (options.verbose)
-        console.log(`[+] Proxying connection to ${target} via ${options.worker}`);
+    socket.requestId = socket.requestId || createRequestId();
+    socket.startedAt = Date.now();
+    socket.target = target;
+
+    logEvent(options, socket, 'proxy.connect.start', { target });
 
     socket.proxyClosed = false;
     socket.proxyHandshakeSent = false;
@@ -94,19 +169,26 @@ const proxyConnect = (target, socket, options) => {
     });
 
     socket.connectTimeoutId = setTimeout(() => {
-        if (options.verbose)
-            console.log(`[!] Worker connect timeout after ${options.connectTimeoutMs}ms`);
+        logEvent(options, socket, 'proxy.error.connect_timeout', {
+            target,
+            timeoutMs: options.connectTimeoutMs,
+        });
         sendProxyFailure(socket, options, 'HTTP/1.1 504 Gateway Timeout\r\n\r\n');
         closeSocketProxy(socket, 'worker connect timeout', options);
     }, options.connectTimeoutMs);
 
     ws.onopen = () => {
         clearTimeout(socket.connectTimeoutId);
+        logEvent(options, socket, 'proxy.connect.open', {
+            target,
+            durationMs: Date.now() - socket.startedAt,
+        });
         sendProxyReady(socket, options);
         refreshIdleTimeout(socket, options);
     };
 
     ws.onerror = () => {
+        logEvent(options, socket, 'proxy.error.websocket', { target });
         sendProxyFailure(socket, options);
         closeSocketProxy(socket, 'worker websocket error', options);
     };
@@ -116,7 +198,11 @@ const proxyConnect = (target, socket, options) => {
 
         if (e.reason == "Expected 101 status code") {
             sendProxyFailure(socket, options);
-            if (options.verbose) console.log('[!] Worker connection failed!');
+            logEvent(options, socket, 'proxy.error.handshake', {
+                target,
+                code: e.code,
+                reason: e.reason,
+            });
         }
 
         closeSocketProxy(socket, `worker websocket closed (${e.code})`, options);
@@ -137,6 +223,17 @@ const httpServer = (options) => Bun.listen({
         async data(socket, data) {
             if (!socket.proxy) {
                 const target = parseTarget(data);
+
+                if (!target) {
+                    socket.requestId = socket.requestId || createRequestId();
+                    socket.startedAt = socket.startedAt || Date.now();
+                    logEvent(options, socket, 'proxy.reject.invalid_target', {
+                        target,
+                    });
+                    socket.shutdown();
+                    return;
+                }
+
                 socket.proxy = proxyConnect(target, socket, options);
             } else {
                 refreshIdleTimeout(socket, options);
@@ -155,6 +252,8 @@ const socks5Server = (options) => Bun.listen({
     socket: {
         async open(socket) {
             socket.step = 0;
+            socket.requestId = createRequestId();
+            socket.startedAt = Date.now();
         },
         async data(socket, data) {
             if (socket.proxy) {
@@ -166,12 +265,14 @@ const socks5Server = (options) => Bun.listen({
             switch (socket.step) {
                 case 0:
                     if (data[0] != 0x05) {
+                        logEvent(options, socket, 'proxy.reject.socks_version', {});
                         if (options.verbose) console.log('[!] SOCKS version mismatch');
                         socket.shutdown();
                     }
 
                     if (!data.slice(2).includes(0x00)) {
                         // either is not a real socks client, or it needs to be authenticated somehow
+                        logEvent(options, socket, 'proxy.reject.socks_client_error', {});
                         if (options.verbose) console.log('[!] SOCKS client error');
                         socket.shutdown();
                     }
@@ -184,12 +285,14 @@ const socks5Server = (options) => Bun.listen({
 
                 case 1:
                     if (data[0] != 0x05 || data[2] != 0x00) {
+                        logEvent(options, socket, 'proxy.reject.socks_version', {});
                         if (options.verbose) console.log('[!] SOCKS version mismatch');
                         socket.shutdown();
                     }
 
                     // we only allow connect (0x01) requests
                     if (data[1] != 0x01) {
+                        logEvent(options, socket, 'proxy.reject.socks_command', {});
                         if (options.verbose) console.log('[!] Client request could not be satisfied');
                         socket.write(Buffer.from([0x05, 0x07, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]));
                         socket.shutdown();
@@ -218,6 +321,7 @@ const socks5Server = (options) => Bun.listen({
                         target = `[${target.replaceAll(':::', ':')}]`;
                     } else {
                         // unknown
+                        logEvent(options, socket, 'proxy.reject.socks_address_type', {});
                         if (options.verbose)
                             console.log('[!] Client request could not be satisfied');
                         socket.shutdown();
@@ -251,8 +355,11 @@ const parseOptions = (argv) => {
             case '--help':
                 return { help: true };
             case '-v':
+                options.verbosity = Math.max(options.verbosity ?? 0, 1);
+                break;
+            case '-vv':
             case '--verbose':
-                options.verbose = true;
+                options.verbosity = 2;
                 break;
             case '-p':
             case '--port':
@@ -267,6 +374,9 @@ const parseOptions = (argv) => {
                 break;
             case '--idle-timeout-ms':
                 options.idleTimeoutMs = parseInt(argv[++i]);
+                break;
+            case '--json-log':
+                options.jsonLog = true;
                 break;
             case 'socks':
                 options.type = 'SOCKS5';
@@ -296,6 +406,7 @@ function main() {
 
     options.connectTimeoutMs = getTimeoutMs(options.connectTimeoutMs, DEFAULT_CONNECT_TIMEOUT_MS);
     options.idleTimeoutMs = getTimeoutMs(options.idleTimeoutMs, DEFAULT_IDLE_TIMEOUT_MS);
+    options.verbosity = options.verbosity ?? 0;
 
     if (options.help) {
         console.log(`${import.meta.file} - Proxy requests through CloudFlare workers`);
@@ -308,9 +419,11 @@ function main() {
         console.log('-a, --auth         Authorization header');
         console.log('--connect-timeout-ms  Worker connect timeout in milliseconds (default: 10000)');
         console.log('--idle-timeout-ms     Idle timeout in milliseconds (default: 30000)');
-        console.log('-v, --verbose      Enable verbose mode (default: false)');
+        console.log('--json-log            Emit logs as JSON instead of human-readable text');
+        console.log('-v                    Show connect.open and close logs');
+        console.log('-vv, --verbose        Show full connection lifecycle logs');
         console.log('')
-        console.log(`Example: bun ${import.meta.file} -v -a auth-secret socks my-instance.workers.dev`);
+        console.log(`Example: bun ${import.meta.file} -vv -a auth-secret socks my-instance.workers.dev`);
         console.log('')
         console.log('By Lucas V. Araujo <root@lva.sh>');
         console.log('More at https://github.com/lvmalware');
