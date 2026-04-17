@@ -74,16 +74,37 @@ const logEvent = (options, socket, event, fields = {}) => {
     console.log(formatTextLog(level, event.replace(/^proxy\./, ''), payload));
 };
 
-const parseTarget = (data) => {
+const parseHttpRequest = (data) => {
     try {
-        return String(data).toLowerCase().split('\n')
-            .filter(l => l.startsWith('host: ')).pop().split(': ')
-            .pop().trim();
+        const text = Buffer.from(data).toString('latin1');
+        const headerEnd = text.indexOf('\r\n\r\n');
+
+        if (headerEnd === -1)
+            return { complete: false };
+
+        const headerText = text.slice(0, headerEnd);
+        const lines = headerText.split('\r\n');
+        const requestLine = lines[0] ?? '';
+        const [method, requestTarget] = requestLine.split(' ');
+
+        if (method === 'CONNECT' && requestTarget)
+            return { complete: true, target: requestTarget.trim(), forwardData: null };
+
+        const hostLine = lines.find(line => line.toLowerCase().startsWith('host: '));
+
+        if (!hostLine)
+            return { complete: true, target: '', forwardData: null };
+
+        return {
+            complete: true,
+            target: hostLine.split(': ').slice(1).join(': ').trim(),
+            forwardData: Buffer.from(data),
+        };
     } catch (e) {
         // log
     }
 
-    return '';
+    return { complete: true, target: '', forwardData: null };
 };
 
 const getTimeoutMs = (value, fallback) => {
@@ -234,13 +255,22 @@ const httpServer = (options) => Bun.listen({
     port: options.port || 8080,
     hostname: '0.0.0.0',
     socket: {
+        async open(socket) {
+            socket.requestId = createRequestId();
+            socket.startedAt = Date.now();
+            socket.httpBuffer = Buffer.alloc(0);
+        },
         async data(socket, data) {
             if (!socket.proxy) {
-                const target = parseTarget(data);
+                socket.httpBuffer = Buffer.concat([socket.httpBuffer, Buffer.from(data)]);
+                const parsed = parseHttpRequest(socket.httpBuffer);
+
+                if (!parsed.complete)
+                    return;
+
+                const target = parsed.target;
 
                 if (!target) {
-                    socket.requestId = socket.requestId || createRequestId();
-                    socket.startedAt = socket.startedAt || Date.now();
                     logEvent(options, socket, 'proxy.reject.invalid_target', {
                         target,
                     });
@@ -249,6 +279,10 @@ const httpServer = (options) => Bun.listen({
                 }
 
                 socket.proxy = proxyConnect(target, socket, options);
+                socket.httpBuffer = Buffer.alloc(0);
+
+                if (parsed.forwardData)
+                    socket.proxy.send(parsed.forwardData);
             } else {
                 refreshIdleTimeout(socket, options);
                 socket.proxy.send(data);
