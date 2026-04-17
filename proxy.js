@@ -1,6 +1,7 @@
 const DEFAULT_CONNECT_TIMEOUT_MS = 10_000;
 const DEFAULT_IDLE_TIMEOUT_MS = 30_000;
 const DEFAULT_WORKER_COOLDOWN_MS = 30_000;
+const DEFAULT_MAX_CONNECTIONS_PER_WORKER = 32;
 
 const createRequestId = () => crypto.randomUUID();
 
@@ -130,7 +131,7 @@ const getWorkerState = (options, worker) => {
     options.workerState ||= new Map();
 
     if (!options.workerState.has(worker))
-        options.workerState.set(worker, { cooldownUntil: 0 });
+        options.workerState.set(worker, { cooldownUntil: 0, activeConnections: 0, waitQueue: [] });
 
     return options.workerState.get(worker);
 };
@@ -145,6 +146,44 @@ const markWorkerSuccess = (options, worker) => {
     state.cooldownUntil = 0;
 };
 
+const releaseWorkerSlot = (options, worker) => {
+    if (!worker)
+        return;
+
+    const state = getWorkerState(options, worker);
+    state.activeConnections = Math.max(0, state.activeConnections - 1);
+
+    while (state.waitQueue.length > 0 && state.activeConnections < options.maxConnectionsPerWorker) {
+        const waiter = state.waitQueue.shift();
+
+        if (waiter.socket?.proxyClosed)
+            continue;
+
+        state.activeConnections++;
+        waiter.resolve();
+        break;
+    }
+};
+
+const acquireWorkerSlot = (options, worker, socket) => {
+    const state = getWorkerState(options, worker);
+
+    if (state.activeConnections < options.maxConnectionsPerWorker) {
+        state.activeConnections++;
+        return Promise.resolve();
+    }
+
+    logEvent(options, socket, 'proxy.queue.wait', {
+        target: socket.target,
+        worker,
+        queueDepth: state.waitQueue.length + 1,
+    });
+
+    return new Promise((resolve) => {
+        state.waitQueue.push({ resolve, socket });
+    });
+};
+
 const clearSocketTimers = (socket) => {
     clearTimeout(socket.connectTimeoutId);
     clearTimeout(socket.idleTimeoutId);
@@ -157,7 +196,10 @@ const closeSocketProxy = (socket, reason, options) => {
         return;
 
     socket.proxyClosed = true;
+    socket.connecting = false;
     clearSocketTimers(socket);
+    releaseWorkerSlot(options, socket.workerSlotOwner);
+    socket.workerSlotOwner = null;
 
     logEvent(options, socket, 'proxy.close', {
         target: socket.target,
@@ -243,7 +285,10 @@ const maybeRetryConnection = (socket, options, reason, extraFields = {}) => {
     }
 
     socket.proxy = undefined;
+    socket.connecting = false;
     clearSocketTimers(socket);
+    releaseWorkerSlot(options, socket.workerSlotOwner);
+    socket.workerSlotOwner = null;
 
     logEvent(options, socket, 'proxy.error.retry', {
         target: socket.target,
@@ -257,7 +302,7 @@ const maybeRetryConnection = (socket, options, reason, extraFields = {}) => {
     return true;
 };
 
-const startProxyConnection = (target, socket, options) => {
+const startProxyConnection = async (target, socket, options) => {
     socket.requestId = socket.requestId || createRequestId();
     socket.startedAt = socket.startedAt || Date.now();
     socket.target = target;
@@ -276,8 +321,21 @@ const startProxyConnection = (target, socket, options) => {
     }
 
     socket.triedWorkers.add(socket.worker);
+    socket.connecting = true;
 
     logEvent(options, socket, 'proxy.connect.start', {
+        target,
+        attempt: socket.connectAttempt,
+    });
+
+    await acquireWorkerSlot(options, socket.worker, socket);
+
+    if (socket.proxyClosed)
+        return null;
+
+    socket.workerSlotOwner = socket.worker;
+
+    logEvent(options, socket, 'proxy.queue.acquire', {
         target,
         attempt: socket.connectAttempt,
     });
@@ -316,6 +374,7 @@ const startProxyConnection = (target, socket, options) => {
 
         clearTimeout(socket.connectTimeoutId);
         markWorkerSuccess(options, socket.worker);
+        socket.connecting = false;
         logEvent(options, socket, 'proxy.connect.open', {
             target,
             durationMs: Date.now() - socket.startedAt,
@@ -327,6 +386,12 @@ const startProxyConnection = (target, socket, options) => {
         if (socket.pendingForwardData) {
             ws.send(socket.pendingForwardData);
             socket.pendingForwardData = null;
+        }
+
+        if (socket.pendingClientData.length > 0) {
+            for (const chunk of socket.pendingClientData)
+                ws.send(chunk);
+            socket.pendingClientData = [];
         }
     };
 
@@ -382,7 +447,9 @@ const proxyConnect = (target, socket, options) => {
     socket.connectAttempt = 0;
     socket.triedWorkers = new Set();
     socket.pendingForwardData = null;
-    return startProxyConnection(target, socket, options);
+    socket.pendingClientData = [];
+    startProxyConnection(target, socket, options);
+    return null;
 };
 
 const httpServer = (options) => Bun.listen({
@@ -412,14 +479,16 @@ const httpServer = (options) => Bun.listen({
                     return;
                 }
 
-                socket.proxy = proxyConnect(target, socket, options);
+                proxyConnect(target, socket, options);
                 socket.httpBuffer = Buffer.alloc(0);
 
                 if (parsed.forwardData)
                     socket.pendingForwardData = parsed.forwardData;
-            } else {
+            } else if (socket.proxy) {
                 refreshIdleTimeout(socket, options);
                 socket.proxy.send(data);
+            } else if (socket.connecting) {
+                socket.pendingClientData.push(Buffer.from(data));
             }
         },
         async close(socket) {
@@ -441,6 +510,11 @@ const socks5Server = (options) => Bun.listen({
             if (socket.proxy) {
                 refreshIdleTimeout(socket, options);
                 socket.proxy.send(data);
+                return;
+            }
+
+            if (socket.connecting) {
+                socket.pendingClientData.push(Buffer.from(data));
                 return;
             }
 
@@ -511,7 +585,7 @@ const socks5Server = (options) => Bun.listen({
 
                     const port = data.at(-1) + data.at(-2) * 256;
                     target = `${target}:${port}`;
-                    socket.proxy = proxyConnect(target, socket, options);
+                    proxyConnect(target, socket, options);
 
                     break;
             }
@@ -563,6 +637,9 @@ const parseOptions = (argv) => {
             case '--worker-cooldown-ms':
                 options.workerCooldownMs = parseInt(argv[++i]);
                 break;
+            case '--max-connections-per-worker':
+                options.maxConnectionsPerWorker = parseInt(argv[++i]);
+                break;
             case '--json-log':
                 options.jsonLog = true;
                 break;
@@ -602,6 +679,7 @@ function main() {
     options.connectTimeoutMs = getTimeoutMs(options.connectTimeoutMs, DEFAULT_CONNECT_TIMEOUT_MS);
     options.idleTimeoutMs = getTimeoutMs(options.idleTimeoutMs, DEFAULT_IDLE_TIMEOUT_MS);
     options.workerCooldownMs = getTimeoutMs(options.workerCooldownMs, DEFAULT_WORKER_COOLDOWN_MS);
+    options.maxConnectionsPerWorker = getRetryCount(options.maxConnectionsPerWorker, DEFAULT_MAX_CONNECTIONS_PER_WORKER);
     options.verbosity = options.verbosity ?? 0;
     options.verbose = options.verbosity > 0;
     options.workers = options.workers?.length ? options.workers : options.worker ? [options.worker] : [];
@@ -627,6 +705,7 @@ function main() {
         console.log('--idle-timeout-ms     Idle timeout in milliseconds (default: 30000)');
         console.log('--connect-retries     Retry failed worker connects (default: workers-1)');
         console.log('--worker-cooldown-ms  Exclude failed workers for this long (default: 30000)');
+        console.log('--max-connections-per-worker  Limit concurrent connects per worker (default: 32)');
         console.log('--json-log            Emit logs as JSON instead of human-readable text');
         console.log('-v                    Show connect.open and close logs');
         console.log('-vv, --verbose        Show full connection lifecycle logs');
