@@ -3,6 +3,16 @@ import { connect } from 'cloudflare:sockets';
 const DEFAULT_CONNECT_TIMEOUT_MS = 10_000;
 const DEFAULT_IDLE_TIMEOUT_MS = 30_000;
 
+const errorResponse = (status, code, message) => new Response(JSON.stringify({
+    error: code,
+    message,
+}), {
+    status,
+    headers: {
+        'Content-Type': 'application/json',
+    },
+});
+
 const isPrivateIpv4 = (host) => {
     const parts = host.split('.').map(Number);
 
@@ -101,6 +111,18 @@ const withTimeout = async (promise, timeoutMs, onTimeout) => {
     }
 };
 
+const classifyError = (error) => {
+    if (error instanceof Error) {
+        if (error.message === 'Timed out')
+            return { status: 504, code: 'upstream_connect_timeout', message: 'Upstream connect timeout' };
+
+        if (/proxy request failed|cannot connect|network connection lost|connection closed/i.test(error.message))
+            return { status: 502, code: 'upstream_connect_failed', message: 'Failed to connect to upstream target' };
+    }
+
+    return { status: 500, code: 'internal_error', message: 'Internal worker error' };
+};
+
 export default {
     async fetch(request, env) {
         const token = env.PROXY_AUTH_TOKEN;
@@ -108,21 +130,21 @@ export default {
         const idleTimeoutMs = getTimeoutMs(env.PROXY_IDLE_TIMEOUT_MS, DEFAULT_IDLE_TIMEOUT_MS);
 
         if (!token)
-            return new Response('Worker is not configured', { status: 500 });
+            return errorResponse(500, 'worker_not_configured', 'Worker is not configured');
 
         if (request.headers.get('Authorization') !== token)
-            return new Response('Unauthorized', { status: 401 });
+            return errorResponse(401, 'unauthorized', 'Unauthorized');
 
         const upgradeHeader = request.headers.get('Upgrade');
 
         if (!upgradeHeader || upgradeHeader !== 'websocket')
-            return new Response('Expected Upgrade: websocket', { status: 426 });
+            return errorResponse(426, 'upgrade_required', 'Expected Upgrade: websocket');
 
         const proxyTarget = request.headers.get('X-Proxy-Target');
         const validation = validateTarget(proxyTarget);
 
         if (!validation.ok)
-            return new Response(validation.message, { status: validation.status });
+            return errorResponse(validation.status, 'invalid_target', validation.message);
 
         try {
             const target = connect(proxyTarget);
@@ -190,10 +212,8 @@ export default {
 
             return new Response(null, { status: 101, webSocket: client, });
         } catch (e) {
-            if (e instanceof Error && e.message === 'Timed out')
-                return new Response('Upstream connect timeout', { status: 504 });
-
-            return new Response(e, { status: 500 });
+            const classified = classifyError(e);
+            return errorResponse(classified.status, classified.code, classified.message);
         }
     }
 }
