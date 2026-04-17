@@ -1,10 +1,13 @@
 import { connect } from 'cloudflare:sockets';
 
 export default {
-    async fetch(request) {
-        const TOKEN = '<YOUR-AUTH-TOKEN>'
+    async fetch(request, env) {
+        const token = env.PROXY_AUTH_TOKEN;
 
-        if (request.headers.get('Authorization') !== TOKEN)
+        if (!token)
+            return new Response('Worker is not configured', { status: 500 });
+
+        if (request.headers.get('Authorization') !== token)
             return new Response('Unauthorized', { status: 401 });
 
         const upgradeHeader = request.headers.get('Upgrade');
