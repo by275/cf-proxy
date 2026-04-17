@@ -11,6 +11,13 @@ const formatTimestamp = (date = new Date()) => {
 
 const shortenRequestId = (requestId) => requestId ? requestId.slice(0, 8) : '--------';
 
+const parseWorkers = (value) => String(value)
+    .split(',')
+    .map(worker => worker.trim())
+    .filter(Boolean);
+
+const isValidWorker = (worker) => /^[\w\-]+(\.[\w\-]+)+$/.test(worker);
+
 const formatTextLog = (level, event, fields) => {
     const parts = [
         `[${level}]`,
@@ -42,7 +49,7 @@ const logEvent = (options, socket, event, fields = {}) => {
         ts: formatTimestamp(),
         req: shortenRequestId(socket.requestId),
         event,
-        worker: options.worker,
+        worker: socket.worker ?? options.worker,
         target: socket.target,
         ...fields,
     };
@@ -151,17 +158,24 @@ const sendProxyFailure = (socket, options, statusLine = 'HTTP/1.1 500 Internal S
         socket.write(Buffer.from([0x5, 0x05, 0x00, 0x01, 0x7f, 0x00, 0x00, 0x01, 0x00, 0x00]));
 };
 
+const selectWorker = (options) => {
+    const worker = options.workers[options.workerCursor % options.workers.length];
+    options.workerCursor = (options.workerCursor + 1) % options.workers.length;
+    return worker;
+};
+
 const proxyConnect = (target, socket, options) => {
     socket.requestId = socket.requestId || createRequestId();
     socket.startedAt = Date.now();
     socket.target = target;
+    socket.worker = selectWorker(options);
 
     logEvent(options, socket, 'proxy.connect.start', { target });
 
     socket.proxyClosed = false;
     socket.proxyHandshakeSent = false;
 
-    const ws = new WebSocket(`wss://${options.worker}`, {
+    const ws = new WebSocket(`wss://${socket.worker}`, {
         headers: {
             Authorization: options.authorization,
             'X-Proxy-Target': target,
@@ -387,8 +401,15 @@ const parseOptions = (argv) => {
                 options.server = httpServer;
                 break;
             default:
-                if (/^[\w\-]+(\.[\w\-]+)+$/.test(argv[i])) {
-                    options.worker = argv[i];
+                if (argv[i].includes(',') || isValidWorker(argv[i])) {
+                    options.workers = parseWorkers(argv[i]);
+
+                    if (!options.workers.length || options.workers.some(worker => !isValidWorker(worker))) {
+                        console.log(`Invalid option: ${argv[i]}`);
+                        return null;
+                    }
+
+                    options.worker = options.workers[0];
                 } else {
                     console.log(`Invalid option: ${argv[i]}`);
                     return null;
@@ -407,10 +428,19 @@ function main() {
     options.connectTimeoutMs = getTimeoutMs(options.connectTimeoutMs, DEFAULT_CONNECT_TIMEOUT_MS);
     options.idleTimeoutMs = getTimeoutMs(options.idleTimeoutMs, DEFAULT_IDLE_TIMEOUT_MS);
     options.verbosity = options.verbosity ?? 0;
+    options.verbose = options.verbosity > 0;
+    options.workers = options.workers?.length ? options.workers : options.worker ? [options.worker] : [];
+    options.worker = options.workers[0];
+    options.workerCursor = 0;
+
+    if (!options.server || !options.workers.length) {
+        console.log('Missing proxy type or worker endpoint');
+        return -1;
+    }
 
     if (options.help) {
         console.log(`${import.meta.file} - Proxy requests through CloudFlare workers`);
-        console.log(`Usage: bun ${import.meta.file} [options] <socks|http> <worker>`);
+        console.log(`Usage: bun ${import.meta.file} [options] <socks|http> <worker[,worker2,...]>`);
         console.log('')
         console.log('Options:');
         console.log('')
@@ -423,7 +453,7 @@ function main() {
         console.log('-v                    Show connect.open and close logs');
         console.log('-vv, --verbose        Show full connection lifecycle logs');
         console.log('')
-        console.log(`Example: bun ${import.meta.file} -vv -a auth-secret socks my-instance.workers.dev`);
+        console.log(`Example: bun ${import.meta.file} -vv -a auth-secret socks my-a.workers.dev,my-b.workers.dev`);
         console.log('')
         console.log('By Lucas V. Araujo <root@lva.sh>');
         console.log('More at https://github.com/lvmalware');
@@ -432,7 +462,7 @@ function main() {
     }
 
     const server = options.server(options);
-    console.log(`[+] ${options.type} proxy server listening on ${server.hostname}:${server.port}`);
+    console.log(`[+] ${options.type} proxy server listening on ${server.hostname}:${server.port} using ${options.workers.length} worker(s)`);
 
     return 0;
 }
