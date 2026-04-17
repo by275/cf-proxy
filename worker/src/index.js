@@ -2,15 +2,14 @@ import { connect } from 'cloudflare:sockets';
 
 const DEFAULT_CONNECT_TIMEOUT_MS = 10_000;
 const DEFAULT_IDLE_TIMEOUT_MS = 30_000;
+const JSON_HEADERS = { 'Content-Type': 'application/json' };
 
 const errorResponse = (status, code, message) => new Response(JSON.stringify({
     error: code,
     message,
 }), {
     status,
-    headers: {
-        'Content-Type': 'application/json',
-    },
+    headers: JSON_HEADERS,
 });
 
 const createRequestId = () => crypto.randomUUID();
@@ -257,7 +256,7 @@ export default {
             let writer;
             let reader;
             let removeServerListeners;
-            let writeChain = Promise.resolve();
+            let upstreamWriteChain = Promise.resolve();
 
             const closeEverything = (code = 1011, reason = 'Proxy closed') => {
                 if (closed)
@@ -323,7 +322,7 @@ export default {
                     return;
 
                 refreshIdleTimeout();
-                writeChain = writeChain
+                upstreamWriteChain = upstreamWriteChain
                     .then(async () => writer.write(await toUint8Array(event.data)))
                     .catch(() => closeEverything(1011, 'Upstream write failed'));
             };
@@ -353,7 +352,7 @@ export default {
                 }
             };
 
-            readLoop().catch((error) => {
+            readLoop().catch(() => {
                 if (closed)
                     return;
 
