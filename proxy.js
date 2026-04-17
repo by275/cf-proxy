@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+
 const DEFAULT_CONNECT_TIMEOUT_MS = 10_000;
 const DEFAULT_IDLE_TIMEOUT_MS = 30_000;
 const DEFAULT_WORKER_COOLDOWN_MS = 30_000;
@@ -20,6 +22,8 @@ const parseWorkers = (value) => String(value)
     .filter(Boolean);
 
 const isValidWorker = (worker) => /^[\w\-]+(\.[\w\-]+)+$/.test(worker);
+const isValidRoutingMode = (value) => value === 'worker' || value === 'direct';
+const isValidFallbackMode = (value) => value === 'worker' || value === 'direct';
 
 const formatTextLog = (level, event, fields) => {
     const parts = [
@@ -110,6 +114,103 @@ const parseHttpRequest = (data) => {
     return { complete: true, target: '', forwardData: null };
 };
 
+const parseTargetAddress = (target) => {
+    if (!target)
+        return null;
+
+    if (target.startsWith('[')) {
+        const end = target.indexOf(']');
+
+        if (end === -1 || target[end + 1] !== ':')
+            return null;
+
+        const host = target.slice(1, end);
+        const port = Number(target.slice(end + 2));
+
+        if (!host || !Number.isInteger(port) || port < 1 || port > 65535)
+            return null;
+
+        return { host, port };
+    }
+
+    const separator = target.lastIndexOf(':');
+
+    if (separator === -1)
+        return null;
+
+    const host = target.slice(0, separator);
+    const port = Number(target.slice(separator + 1));
+
+    if (!host || !Number.isInteger(port) || port < 1 || port > 65535)
+        return null;
+
+    return { host, port };
+};
+
+const parseJsonObject = (value, fallback = {}) => {
+    if (!value)
+        return fallback;
+
+    try {
+        const parsed = JSON.parse(value);
+        return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : fallback;
+    } catch {
+        return fallback;
+    }
+};
+
+const normalizePolicy = (policy) => {
+    if (!policy || typeof policy !== 'object' || Array.isArray(policy))
+        return {};
+
+    const normalized = {};
+
+    if (isValidRoutingMode(policy.mode))
+        normalized.mode = policy.mode;
+
+    if (isValidFallbackMode(policy.fallback))
+        normalized.fallback = policy.fallback;
+
+    if (Array.isArray(policy.preferredWorkers)) {
+        normalized.preferredWorkers = policy.preferredWorkers
+            .map(worker => String(worker).trim())
+            .filter(worker => isValidWorker(worker));
+    }
+
+    return normalized;
+};
+
+const loadRoutingPolicies = (options) => {
+    let filePolicies = {};
+
+    if (options.routingPolicyFile) {
+        try {
+            filePolicies = parseJsonObject(readFileSync(options.routingPolicyFile, 'utf8'));
+        } catch (error) {
+            throw new Error(`Failed to read routing policy file: ${options.routingPolicyFile}`);
+        }
+    }
+
+    const jsonPolicies = parseJsonObject(options.routingPolicyJson);
+    const merged = { ...filePolicies, ...jsonPolicies };
+
+    return Object.fromEntries(
+        Object.entries(merged).map(([host, policy]) => [host.toLowerCase(), normalizePolicy(policy)])
+    );
+};
+
+const getRoutingPolicy = (options, target) => {
+    const host = parseTargetAddress(target)?.host?.toLowerCase();
+    const defaultPolicy = options.routingPolicies?.['*'] ?? {};
+    const targetPolicy = host ? options.routingPolicies?.[host] ?? {} : {};
+
+    return {
+        mode: targetPolicy.mode ?? defaultPolicy.mode ?? 'worker',
+        fallback: targetPolicy.fallback ?? defaultPolicy.fallback,
+        preferredWorkers: targetPolicy.preferredWorkers ?? defaultPolicy.preferredWorkers ?? [],
+    };
+};
+
 const getTimeoutMs = (value, fallback) => {
     const parsed = Number(value);
 
@@ -192,6 +293,30 @@ const clearSocketTimers = (socket) => {
     socket.idleTimeoutId = undefined;
 };
 
+const sendUpstream = (socket, data) => {
+    if (!socket.proxy)
+        return;
+
+    if (typeof socket.proxy.send === 'function')
+        socket.proxy.send(data);
+    else if (typeof socket.proxy.write === 'function')
+        socket.proxy.write(data);
+};
+
+const closeUpstream = (socket) => {
+    if (!socket.proxy)
+        return;
+
+    try {
+        if (typeof socket.proxy.close === 'function')
+            socket.proxy.close();
+        else if (typeof socket.proxy.end === 'function')
+            socket.proxy.end();
+    } catch {
+        // ignore close errors
+    }
+};
+
 const removeActiveSocket = (options, socket) => {
     options.activeSockets?.delete(socket);
 };
@@ -215,11 +340,7 @@ const closeSocketProxy = (socket, reason, options) => {
     if (options.verbose && reason)
         console.log(`[!] Closing ${options.type} proxy connection: ${reason}`);
 
-    try {
-        socket.proxy?.close();
-    } catch {
-        // ignore close errors
-    }
+    closeUpstream(socket);
 
     socket.shutdown();
 };
@@ -247,7 +368,10 @@ const flushPendingClientData = (socket, ws) => {
         return;
 
     for (const chunk of socket.pendingClientData)
-        ws.send(chunk);
+        if (typeof ws.send === 'function')
+            ws.send(chunk);
+        else if (typeof ws.write === 'function')
+            ws.write(chunk);
 
     socket.pendingClientData = [];
     socket.pendingClientBytes = 0;
@@ -289,18 +413,22 @@ const sendProxyFailure = (socket, options, statusLine = 'HTTP/1.1 500 Internal S
         socket.write(Buffer.from([0x5, 0x05, 0x00, 0x01, 0x7f, 0x00, 0x00, 0x01, 0x00, 0x00]));
 };
 
-const selectWorker = (options, excludedWorkers = new Set()) => {
+const selectWorker = (options, excludedWorkers = new Set(), preferredWorkers = []) => {
     const now = Date.now();
 
-    for (let i = 0; i < options.workers.length; i++) {
-        const index = (options.workerCursor + i) % options.workers.length;
-        const worker = options.workers[index];
+    const orderedWorkers = [
+        ...preferredWorkers.filter(worker => options.workers.includes(worker)),
+        ...options.workers.filter(worker => !preferredWorkers.includes(worker)),
+    ];
+
+    for (let i = 0; i < orderedWorkers.length; i++) {
+        const worker = orderedWorkers[(options.workerCursor + i) % orderedWorkers.length];
         const state = getWorkerState(options, worker);
 
         if (excludedWorkers.has(worker) || state.cooldownUntil > now)
             continue;
 
-        options.workerCursor = (index + 1) % options.workers.length;
+        options.workerCursor = (options.workers.indexOf(worker) + 1) % options.workers.length;
         return worker;
     }
 
@@ -308,7 +436,7 @@ const selectWorker = (options, excludedWorkers = new Set()) => {
 };
 
 const maybeRetryConnection = (socket, options, reason, extraFields = {}) => {
-    if (socket.proxyHandshakeSent)
+    if (socket.proxyHandshakeSent || socket.routingMode !== 'worker')
         return false;
 
     const retriesUsed = socket.connectAttempt - 1;
@@ -341,6 +469,40 @@ const maybeRetryConnection = (socket, options, reason, extraFields = {}) => {
     return true;
 };
 
+const maybeFallbackConnection = (socket, options, reason, extraFields = {}) => {
+    if (socket.proxyHandshakeSent)
+        return false;
+
+    const fallback = socket.routingPolicy?.fallback;
+
+    if (!fallback || fallback === socket.routingMode || socket.usedFallback)
+        return false;
+
+    socket.proxy = undefined;
+    socket.connecting = false;
+    clearSocketTimers(socket);
+    releaseWorkerSlot(options, socket.workerSlotOwner);
+    socket.workerSlotOwner = null;
+    socket.usedFallback = true;
+
+    logEvent(options, socket, 'proxy.error.fallback', {
+        target: socket.target,
+        reason,
+        fallback,
+        ...extraFields,
+    });
+
+    if (fallback === 'direct') {
+        startDirectConnection(socket.target, socket, options);
+        return true;
+    }
+
+    socket.triedWorkers = new Set();
+    socket.connectAttempt = 0;
+    startProxyConnection(socket.target, socket, options);
+    return true;
+};
+
 const startProxyConnection = async (target, socket, options) => {
     if (options.shuttingDown) {
         closeSocketProxy(socket, 'proxy shutting down', options);
@@ -350,15 +512,20 @@ const startProxyConnection = async (target, socket, options) => {
     socket.requestId = socket.requestId || createRequestId();
     socket.startedAt = socket.startedAt || Date.now();
     socket.target = target;
+    socket.routingMode = 'worker';
     socket.triedWorkers ||= new Set();
     socket.connectAttempt = (socket.connectAttempt ?? 0) + 1;
-    socket.worker = selectWorker(options, socket.triedWorkers);
+    socket.worker = selectWorker(options, socket.triedWorkers, socket.routingPolicy?.preferredWorkers ?? []);
 
     if (!socket.worker) {
         logEvent(options, socket, 'proxy.error.no_worker_available', {
             target,
             attempts: socket.connectAttempt,
         });
+
+        if (maybeFallbackConnection(socket, options, 'no_worker_available', { attempts: socket.connectAttempt }))
+            return null;
+
         sendProxyFailure(socket, options, 'HTTP/1.1 503 Service Unavailable\r\n\r\n');
         closeSocketProxy(socket, 'no worker available', options);
         return null;
@@ -412,6 +579,9 @@ const startProxyConnection = async (target, socket, options) => {
         });
 
         if (!maybeRetryConnection(socket, options, 'connect_timeout', { timeoutMs: options.connectTimeoutMs })) {
+            if (maybeFallbackConnection(socket, options, 'connect_timeout', { timeoutMs: options.connectTimeoutMs }))
+                return;
+
             sendProxyFailure(socket, options, 'HTTP/1.1 504 Gateway Timeout\r\n\r\n');
             closeSocketProxy(socket, 'worker connect timeout', options);
         }
@@ -448,6 +618,9 @@ const startProxyConnection = async (target, socket, options) => {
         logEvent(options, socket, 'proxy.error.websocket', { target });
 
         if (!maybeRetryConnection(socket, options, 'websocket_error')) {
+            if (maybeFallbackConnection(socket, options, 'websocket_error'))
+                return;
+
             sendProxyFailure(socket, options);
             closeSocketProxy(socket, 'worker websocket error', options);
         }
@@ -471,6 +644,9 @@ const startProxyConnection = async (target, socket, options) => {
             if (maybeRetryConnection(socket, options, 'handshake_failed', { code: e.code }))
                 return;
 
+            if (maybeFallbackConnection(socket, options, 'handshake_failed', { code: e.code }))
+                return;
+
             sendProxyFailure(socket, options);
         }
 
@@ -488,12 +664,165 @@ const startProxyConnection = async (target, socket, options) => {
     return ws;
 };
 
+const startDirectConnection = async (target, socket, options) => {
+    const address = parseTargetAddress(target);
+
+    if (!address) {
+        logEvent(options, socket, 'proxy.reject.invalid_target', { target });
+        sendProxyFailure(socket, options, 'HTTP/1.1 400 Bad Request\r\n\r\n');
+        closeSocketProxy(socket, 'invalid direct target', options);
+        return null;
+    }
+
+    socket.requestId = socket.requestId || createRequestId();
+    socket.startedAt = socket.startedAt || Date.now();
+    socket.target = target;
+    socket.worker = 'direct';
+    socket.routingMode = 'direct';
+    socket.connecting = true;
+
+    logEvent(options, socket, 'proxy.connect.start', {
+        target,
+        mode: 'direct',
+    });
+
+    try {
+        const directSocket = await Bun.connect({
+            hostname: address.host,
+            port: address.port,
+            socket: {
+                open(connection) {
+                    if (socket.proxy !== connection)
+                        return;
+
+                    socket.connecting = false;
+                    logEvent(options, socket, 'proxy.connect.open', {
+                        target,
+                        durationMs: Date.now() - socket.startedAt,
+                        mode: 'direct',
+                    });
+                    sendProxyReady(socket, options);
+                    refreshIdleTimeout(socket, options);
+
+                    if (socket.pendingForwardData) {
+                        connection.write(socket.pendingForwardData);
+                        socket.pendingForwardData = null;
+                    }
+
+                    flushPendingClientData(socket, connection);
+                },
+                data(connection, data) {
+                    if (socket.proxy !== connection)
+                        return;
+
+                    refreshIdleTimeout(socket, options);
+                    socket.write(data);
+                },
+                close(connection) {
+                    if (socket.proxy !== connection)
+                        return;
+
+                    closeSocketProxy(socket, 'direct socket closed', options);
+                },
+                end(connection) {
+                    if (socket.proxy !== connection)
+                        return;
+
+                    closeSocketProxy(socket, 'direct socket ended', options);
+                },
+                error(connection) {
+                    if (socket.proxy !== connection)
+                        return;
+
+                    logEvent(options, socket, 'proxy.error.direct_socket', {
+                        target,
+                        mode: 'direct',
+                    });
+
+                    if (maybeFallbackConnection(socket, options, 'direct_socket_error'))
+                        return;
+
+                    sendProxyFailure(socket, options, 'HTTP/1.1 502 Bad Gateway\r\n\r\n');
+                    closeSocketProxy(socket, 'direct socket error', options);
+                },
+                connectError(connection) {
+                    if (socket.proxy !== connection)
+                        return;
+
+                    logEvent(options, socket, 'proxy.error.direct_connect', {
+                        target,
+                        mode: 'direct',
+                    });
+
+                    if (maybeFallbackConnection(socket, options, 'direct_connect_error'))
+                        return;
+
+                    sendProxyFailure(socket, options, 'HTTP/1.1 502 Bad Gateway\r\n\r\n');
+                    closeSocketProxy(socket, 'direct connect error', options);
+                },
+                timeout(connection) {
+                    if (socket.proxy !== connection)
+                        return;
+
+                    logEvent(options, socket, 'proxy.error.direct_timeout', {
+                        target,
+                        timeoutMs: options.connectTimeoutMs,
+                        mode: 'direct',
+                    });
+
+                    if (maybeFallbackConnection(socket, options, 'direct_timeout', { timeoutMs: options.connectTimeoutMs }))
+                        return;
+
+                    sendProxyFailure(socket, options, 'HTTP/1.1 504 Gateway Timeout\r\n\r\n');
+                    closeSocketProxy(socket, 'direct connect timeout', options);
+                },
+            },
+        });
+
+        socket.proxy = directSocket;
+        socket.connectTimeoutId = setTimeout(() => {
+            if (socket.proxy !== directSocket)
+                return;
+
+            logEvent(options, socket, 'proxy.error.direct_timeout', {
+                target,
+                timeoutMs: options.connectTimeoutMs,
+                mode: 'direct',
+            });
+            sendProxyFailure(socket, options, 'HTTP/1.1 504 Gateway Timeout\r\n\r\n');
+            closeSocketProxy(socket, 'direct connect timeout', options);
+        }, options.connectTimeoutMs);
+
+        return directSocket;
+    } catch {
+        logEvent(options, socket, 'proxy.error.direct_connect', {
+            target,
+            mode: 'direct',
+        });
+
+        if (maybeFallbackConnection(socket, options, 'direct_connect_error'))
+            return null;
+
+        sendProxyFailure(socket, options, 'HTTP/1.1 502 Bad Gateway\r\n\r\n');
+        closeSocketProxy(socket, 'direct connect error', options);
+        return null;
+    }
+};
+
 const proxyConnect = (target, socket, options) => {
+    socket.routingPolicy = getRoutingPolicy(options, target);
     socket.connectAttempt = 0;
     socket.triedWorkers = new Set();
+    socket.usedFallback = false;
     socket.pendingForwardData = null;
     socket.pendingClientData = [];
     socket.pendingClientBytes = 0;
+
+    if (socket.routingPolicy.mode === 'direct') {
+        startDirectConnection(target, socket, options);
+        return null;
+    }
+
     startProxyConnection(target, socket, options);
     return null;
 };
@@ -541,14 +870,14 @@ const httpServer = (options) => Bun.listen({
                     return;
                 }
 
-                proxyConnect(target, socket, options);
-                socket.httpBuffer = Buffer.alloc(0);
-
                 if (parsed.forwardData)
                     socket.pendingForwardData = parsed.forwardData;
+
+                proxyConnect(target, socket, options);
+                socket.httpBuffer = Buffer.alloc(0);
             } else if (socket.proxy) {
                 refreshIdleTimeout(socket, options);
-                socket.proxy.send(data);
+                sendUpstream(socket, data);
             } else if (socket.connecting) {
                 queuePendingClientData(socket, data, options);
             }
@@ -575,7 +904,7 @@ const socks5Server = (options) => Bun.listen({
 
             if (socket.proxy) {
                 refreshIdleTimeout(socket, options);
-                socket.proxy.send(data);
+                sendUpstream(socket, data);
                 return;
             }
 
@@ -713,6 +1042,12 @@ const parseOptions = (argv) => {
             case '--json-log':
                 options.jsonLog = true;
                 break;
+            case '--routing-policy-file':
+                options.routingPolicyFile = argv[++i];
+                break;
+            case '--routing-policy-json':
+                options.routingPolicyJson = argv[++i];
+                break;
             case 'socks':
                 options.type = 'SOCKS5';
                 options.server = socks5Server;
@@ -757,6 +1092,7 @@ function main() {
     options.worker = options.workers[0];
     options.workerCursor = 0;
     options.connectRetries = getRetryCount(options.connectRetries, Math.max(0, options.workers.length - 1));
+    options.routingPolicies = loadRoutingPolicies(options);
 
     if (!options.server || !options.workers.length) {
         console.log('Missing proxy type or worker endpoint');
@@ -778,6 +1114,8 @@ function main() {
         console.log('--worker-cooldown-ms  Exclude failed workers for this long (default: 30000)');
         console.log('--max-connections-per-worker  Limit concurrent connects per worker (default: 32)');
         console.log('--max-pending-bytes   Cap queued client bytes before connect/open (default: 1048576)');
+        console.log('--routing-policy-file Path to routing policy JSON file');
+        console.log('--routing-policy-json Inline routing policy JSON');
         console.log('--json-log            Emit logs as JSON instead of human-readable text');
         console.log('-v                    Show connect.open and close logs');
         console.log('-vv, --verbose        Show full connection lifecycle logs');
