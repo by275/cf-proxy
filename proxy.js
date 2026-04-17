@@ -24,6 +24,7 @@ const parseWorkers = (value) => String(value)
 const isValidWorker = (worker) => /^[\w\-]+(\.[\w\-]+)+$/.test(worker);
 const isValidRoutingMode = (value) => value === 'worker' || value === 'direct';
 const isValidFallbackMode = (value) => value === 'worker' || value === 'direct';
+const HTTP_METHOD_PREFIXES = ['CONNECT ', 'GET ', 'POST ', 'HEAD ', 'PUT ', 'DELETE ', 'OPTIONS ', 'PATCH ', 'TRACE '];
 
 const formatTextLog = (level, event, fields) => {
     const parts = [
@@ -127,6 +128,50 @@ const parseHttpRequest = (data) => {
     }
 
     return { complete: true, target: '', forwardData: null };
+};
+
+const parseListenSpec = (value) => {
+    let url;
+
+    try {
+        url = new URL(value);
+    } catch {
+        return null;
+    }
+
+    const protocol = url.protocol.replace(/:$/, '');
+    const protocols = protocol.split('+').map(part => part.trim()).filter(Boolean);
+    const allowedProtocols = new Set(['http', 'socks']);
+
+    if (!protocols.length || protocols.some(part => !allowedProtocols.has(part)))
+        return null;
+
+    const hostname = url.hostname || '0.0.0.0';
+    const port = Number(url.port || (protocols.length === 1 && protocols[0] === 'http' ? 8080 : 1080));
+
+    if (!Number.isInteger(port) || port < 1 || port > 65535)
+        return null;
+
+    return {
+        hostname,
+        port,
+        protocols,
+    };
+};
+
+const detectListenerProtocol = (data) => {
+    if (!data || data.length === 0)
+        return null;
+
+    if (data[0] === 0x05)
+        return 'SOCKS5';
+
+    const text = Buffer.from(data.subarray(0, Math.min(data.length, 8))).toString('latin1').toUpperCase();
+
+    if (HTTP_METHOD_PREFIXES.some(prefix => text.startsWith(prefix)))
+        return 'HTTP';
+
+    return null;
 };
 
 
@@ -405,13 +450,23 @@ const refreshIdleTimeout = (socket, options) => {
     }, options.idleTimeoutMs);
 };
 
+const getSocketProtocolType = (socket, options) => {
+    if (socket.protocolMode === 'HTTP')
+        return 'HTTP';
+
+    if (socket.protocolMode === 'SOCKS5')
+        return 'SOCKS5';
+
+    return options.type;
+};
+
 const sendProxyReady = (socket, options) => {
     if (socket.proxyHandshakeSent)
         return;
 
     socket.proxyHandshakeSent = true;
 
-    if (options.type == 'HTTP')
+    if (getSocketProtocolType(socket, options) == 'HTTP')
         socket.write('HTTP/1.1 200 OK\r\n\r\n');
     else
         socket.write(Buffer.from([0x5, 0x00, 0x00, 0x01, 0x7f, 0x00, 0x00, 0x01, 0x00, 0x00]));
@@ -423,7 +478,7 @@ const sendProxyFailure = (socket, options, statusLine = 'HTTP/1.1 500 Internal S
 
     socket.proxyHandshakeSent = true;
 
-    if (options.type == 'HTTP')
+    if (getSocketProtocolType(socket, options) == 'HTTP')
         socket.write(statusLine);
     else
         socket.write(Buffer.from([0x5, 0x05, 0x00, 0x01, 0x7f, 0x00, 0x00, 0x01, 0x00, 0x00]));
@@ -858,57 +913,140 @@ const initializeSocket = (socket, options, extra = {}) => {
         socket.shutdown();
 };
 
+const handleHttpSocketData = (socket, data, options) => {
+    if (options.shuttingDown) {
+        closeSocketProxy(socket, 'proxy shutting down', options);
+        return;
+    }
+
+    if (!socket.proxy) {
+        socket.httpBuffer = Buffer.concat([socket.httpBuffer, Buffer.from(data)]);
+        const parsed = parseHttpRequest(socket.httpBuffer);
+
+        if (!parsed.complete)
+            return;
+
+        const target = parsed.target;
+
+        if (parsed.unsupportedMethod) {
+            logEvent(options, socket, 'proxy.reject.http_method', {
+                method: parsed.method,
+            });
+            sendProxyFailure(socket, options, 'HTTP/1.1 405 Method Not Allowed\r\n\r\n');
+            closeSocketProxy(socket, `unsupported HTTP method: ${parsed.method}`, options);
+            socket.httpBuffer = Buffer.alloc(0);
+            return;
+        }
+
+        if (!target) {
+            logEvent(options, socket, 'proxy.reject.invalid_target', {
+                target,
+            });
+            socket.shutdown();
+            return;
+        }
+
+        if (parsed.forwardData)
+            socket.pendingForwardData = parsed.forwardData;
+
+        proxyConnect(target, socket, options);
+        socket.httpBuffer = Buffer.alloc(0);
+    } else if (socket.proxy) {
+        refreshIdleTimeout(socket, options);
+        sendUpstream(socket, data);
+    } else if (socket.connecting) {
+        queuePendingClientData(socket, data, options);
+    }
+};
+
+const handleSocksSocketData = (socket, data, options) => {
+    if (options.shuttingDown) {
+        closeSocketProxy(socket, 'proxy shutting down', options);
+        return;
+    }
+
+    if (socket.proxy) {
+        refreshIdleTimeout(socket, options);
+        sendUpstream(socket, data);
+        return;
+    }
+
+    if (socket.connecting) {
+        queuePendingClientData(socket, data, options);
+        return;
+    }
+
+    switch (socket.step) {
+        case 0:
+            if (data[0] != 0x05) {
+                logEvent(options, socket, 'proxy.reject.socks_version', {});
+                if (options.verbose) console.log('[!] SOCKS version mismatch');
+                socket.shutdown();
+            }
+
+            if (!data.slice(2).includes(0x00)) {
+                logEvent(options, socket, 'proxy.reject.socks_client_error', {});
+                if (options.verbose) console.log('[!] SOCKS client error');
+                socket.shutdown();
+            }
+
+            socket.write(Buffer.from([0x5, 0x00]));
+            socket.step++;
+            break;
+
+        case 1:
+            if (data[0] != 0x05 || data[2] != 0x00) {
+                logEvent(options, socket, 'proxy.reject.socks_version', {});
+                if (options.verbose) console.log('[!] SOCKS version mismatch');
+                socket.shutdown();
+            }
+
+            if (data[1] != 0x01) {
+                logEvent(options, socket, 'proxy.reject.socks_command', {});
+                if (options.verbose) console.log('[!] Client request could not be satisfied');
+                socket.write(Buffer.from([0x05, 0x07, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]));
+                socket.shutdown();
+            }
+
+            let target = '';
+
+            if (data[3] == 0x1) {
+                target = data.slice(4, 8).map(n => n.toString()).join('.');
+            } else if (data[3] == 0x3) {
+                target = String(Buffer.from(data.slice(5, 5 + data[4])));
+            } else if (data[3] == 0x4) {
+                const ipv6 = Array.from(data.slice(4, 20)).map(b => b.toString(16).padStart(2, 0));
+
+                for (let i = 0; i < ipv6.length; i += 2) {
+                    if (i != 0) target += ':';
+                    target += ipv6.slice(i, i + 2).join('');
+                }
+
+                target = target.replaceAll(':00', ':').replaceAll(':00', ':');
+                target = `[${target.replaceAll(':::', ':')}]`;
+            } else {
+                logEvent(options, socket, 'proxy.reject.socks_address_type', {});
+                if (options.verbose)
+                    console.log('[!] Client request could not be satisfied');
+                socket.shutdown();
+            }
+
+            const port = data.at(-1) + data.at(-2) * 256;
+            target = `${target}:${port}`;
+            proxyConnect(target, socket, options);
+            break;
+    }
+};
+
 const httpServer = (options) => Bun.listen({
-    port: options.port || 8080,
-    hostname: '0.0.0.0',
+    port: (options.listenPort ?? options.port) || 8080,
+    hostname: options.listenHost ?? '0.0.0.0',
     socket: {
         async open(socket) {
-            initializeSocket(socket, options);
+            initializeSocket(socket, options, { protocolMode: 'HTTP' });
         },
         async data(socket, data) {
-            if (options.shuttingDown) {
-                closeSocketProxy(socket, 'proxy shutting down', options);
-                return;
-            }
-
-            if (!socket.proxy) {
-                socket.httpBuffer = Buffer.concat([socket.httpBuffer, Buffer.from(data)]);
-                const parsed = parseHttpRequest(socket.httpBuffer);
-
-                if (!parsed.complete)
-                    return;
-
-                const target = parsed.target;
-
-                if (parsed.unsupportedMethod) {
-                    logEvent(options, socket, 'proxy.reject.http_method', {
-                        method: parsed.method,
-                    });
-                    sendProxyFailure(socket, options, 'HTTP/1.1 405 Method Not Allowed\r\n\r\n');
-                    closeSocketProxy(socket, `unsupported HTTP method: ${parsed.method}`, options);
-                    socket.httpBuffer = Buffer.alloc(0);
-                    return;
-                }
-
-                if (!target) {
-                    logEvent(options, socket, 'proxy.reject.invalid_target', {
-                        target,
-                    });
-                    socket.shutdown();
-                    return;
-                }
-
-                if (parsed.forwardData)
-                    socket.pendingForwardData = parsed.forwardData;
-
-                proxyConnect(target, socket, options);
-                socket.httpBuffer = Buffer.alloc(0);
-            } else if (socket.proxy) {
-                refreshIdleTimeout(socket, options);
-                sendUpstream(socket, data);
-            } else if (socket.connecting) {
-                queuePendingClientData(socket, data, options);
-            }
+            handleHttpSocketData(socket, data, options);
         },
         async close(socket) {
             removeActiveSocket(options, socket);
@@ -918,100 +1056,46 @@ const httpServer = (options) => Bun.listen({
 });
 
 const socks5Server = (options) => Bun.listen({
-    port: options.port || 1080,
-    hostname: '0.0.0.0',
+    port: (options.listenPort ?? options.port) || 1080,
+    hostname: options.listenHost ?? '0.0.0.0',
     socket: {
         async open(socket) {
-            initializeSocket(socket, options, { step: 0 });
+            initializeSocket(socket, options, { protocolMode: 'SOCKS5', step: 0 });
         },
         async data(socket, data) {
-            if (options.shuttingDown) {
-                closeSocketProxy(socket, 'proxy shutting down', options);
+            handleSocksSocketData(socket, data, options);
+        },
+        async close(socket) {
+            removeActiveSocket(options, socket);
+            closeSocketProxy(socket, 'client socket closed', options);
+        }
+    }
+});
+
+const mixedServer = (options) => Bun.listen({
+    port: (options.listenPort ?? options.port) || 1080,
+    hostname: options.listenHost ?? '0.0.0.0',
+    socket: {
+        async open(socket) {
+            initializeSocket(socket, options, { protocolMode: null, step: 0 });
+        },
+        async data(socket, data) {
+            if (!socket.protocolMode) {
+                socket.protocolMode = detectListenerProtocol(data);
+
+                if (!socket.protocolMode) {
+                    logEvent(options, socket, 'proxy.reject.listener_protocol', {});
+                    socket.shutdown();
+                    return;
+                }
+            }
+
+            if (socket.protocolMode === 'HTTP') {
+                handleHttpSocketData(socket, data, options);
                 return;
             }
 
-            if (socket.proxy) {
-                refreshIdleTimeout(socket, options);
-                sendUpstream(socket, data);
-                return;
-            }
-
-            if (socket.connecting) {
-                queuePendingClientData(socket, data, options);
-                return;
-            }
-
-            switch (socket.step) {
-                case 0:
-                    if (data[0] != 0x05) {
-                        logEvent(options, socket, 'proxy.reject.socks_version', {});
-                        if (options.verbose) console.log('[!] SOCKS version mismatch');
-                        socket.shutdown();
-                    }
-
-                    if (!data.slice(2).includes(0x00)) {
-                        // either is not a real socks client, or it needs to be authenticated somehow
-                        logEvent(options, socket, 'proxy.reject.socks_client_error', {});
-                        if (options.verbose) console.log('[!] SOCKS client error');
-                        socket.shutdown();
-                    }
-
-                    // no auth required
-                    socket.write(Buffer.from([0x5, 0x00]));
-                    socket.step++;
-
-                    break;
-
-                case 1:
-                    if (data[0] != 0x05 || data[2] != 0x00) {
-                        logEvent(options, socket, 'proxy.reject.socks_version', {});
-                        if (options.verbose) console.log('[!] SOCKS version mismatch');
-                        socket.shutdown();
-                    }
-
-                    // we only allow connect (0x01) requests
-                    if (data[1] != 0x01) {
-                        logEvent(options, socket, 'proxy.reject.socks_command', {});
-                        if (options.verbose) console.log('[!] Client request could not be satisfied');
-                        socket.write(Buffer.from([0x05, 0x07, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]));
-                        socket.shutdown();
-                    }
-
-                    // now we parse the target information
-                    let target = '';
-
-                    if (data[3] == 0x1) {
-                        // ipv4
-                        target = data.slice(4, 8).map(n => n.toString()).join('.');
-                    } else if (data[3] == 0x3) {
-                        // domain
-                        target = String(Buffer.from(data.slice(5, 5 + data[4])));
-                    } else if (data[3] == 0x4) {
-                        // ipv6
-                        const ipv6 = Array.from(data.slice(4, 20)).map(b => b.toString(16).padStart(2, 0));
-
-                        for (let i = 0; i < ipv6.length; i += 2) {
-                            if (i != 0) target += ':';
-                            target += ipv6.slice(i, i + 2).join('');
-                        }
-
-                        // ipv6 short form
-                        target = target.replaceAll(':00', ':').replaceAll(':00', ':');
-                        target = `[${target.replaceAll(':::', ':')}]`;
-                    } else {
-                        // unknown
-                        logEvent(options, socket, 'proxy.reject.socks_address_type', {});
-                        if (options.verbose)
-                            console.log('[!] Client request could not be satisfied');
-                        socket.shutdown();
-                    }
-
-                    const port = data.at(-1) + data.at(-2) * 256;
-                    target = `${target}:${port}`;
-                    proxyConnect(target, socket, options);
-
-                    break;
-            }
+            handleSocksSocketData(socket, data, options);
         },
         async close(socket) {
             removeActiveSocket(options, socket);
@@ -1023,7 +1107,7 @@ const socks5Server = (options) => Bun.listen({
 const parseOptions = (argv) => {
     // poor man's arg parser
 
-    if (argv.length < 2) {
+    if (argv.length < 1) {
         return { help: true };
     }
 
@@ -1041,9 +1125,13 @@ const parseOptions = (argv) => {
             case '--verbose':
                 options.verbosity = 2;
                 break;
-            case '-p':
-            case '--port':
-                options.port = parseInt(argv[++i]);
+            case '-l':
+            case '--listen':
+                options.listen = parseListenSpec(argv[++i]);
+                if (!options.listen) {
+                    console.log(`Invalid listen spec: ${argv[i]}`);
+                    return null;
+                }
                 break;
             case '-a':
             case '--auth':
@@ -1075,14 +1163,6 @@ const parseOptions = (argv) => {
                 break;
             case '--routing-policy-json':
                 options.routingPolicyJson = argv[++i];
-                break;
-            case 'socks':
-                options.type = 'SOCKS5';
-                options.server = socks5Server;
-                break;
-            case 'http':
-                options.type = 'HTTP';
-                options.server = httpServer;
                 break;
             default:
                 if (argv[i].includes(',') || isValidWorker(argv[i])) {
@@ -1122,19 +1202,32 @@ function main() {
     options.connectRetries = getRetryCount(options.connectRetries, Math.max(0, options.workers.length - 1));
     options.routingPolicies = loadRoutingPolicies(options);
 
-    if (!options.server || !options.workers.length) {
-        console.log('Missing proxy type or worker endpoint');
-        return -1;
+    if (options.listen) {
+        options.listenHost = options.listen.hostname;
+        options.listenPort = options.listen.port;
+
+        if (options.listen.protocols.length === 1) {
+            if (options.listen.protocols[0] === 'http') {
+                options.type = 'HTTP';
+                options.server = httpServer;
+            } else {
+                options.type = 'SOCKS5';
+                options.server = socks5Server;
+            }
+        } else {
+            options.type = 'SOCKS5+HTTP';
+            options.server = mixedServer;
+        }
     }
 
     if (options.help) {
         console.log(`${import.meta.file} - Proxy requests through CloudFlare workers`);
-        console.log(`Usage: bun ${import.meta.file} [options] <socks|http> <worker[,worker2,...]>`);
+        console.log(`Usage: bun ${import.meta.file} [options] -l <listen-uri> <worker[,worker2,...]>`);
         console.log('')
         console.log('Options:');
         console.log('')
         console.log('-h, --help         Show this help message and exit');
-        console.log('-p, --port         Port to listen on (defaults to 1080 for socks and 8080 for http)');
+        console.log('-l, --listen       Listen URI, e.g. http://0.0.0.0:8080 or socks+http://0.0.0.0:8923');
         console.log('-a, --auth         Authorization header');
         console.log('--connect-timeout-ms  Worker connect timeout in milliseconds (default: 10000)');
         console.log('--idle-timeout-ms     Idle timeout in milliseconds (default: 30000)');
@@ -1148,12 +1241,17 @@ function main() {
         console.log('-v                    Show connect.open and close logs');
         console.log('-vv, --verbose        Show full connection lifecycle logs');
         console.log('')
-        console.log(`Example: bun ${import.meta.file} -vv -a auth-secret socks my-a.workers.dev,my-b.workers.dev`);
+        console.log(`Example: bun ${import.meta.file} -vv -a auth-secret -l socks+http://0.0.0.0:8923 my-a.workers.dev,my-b.workers.dev`);
         console.log('')
         console.log('By Lucas V. Araujo <root@lva.sh>');
         console.log('More at https://github.com/lvmalware');
 
         return 0;
+    }
+
+    if (!options.listen || !options.server || !options.workers.length) {
+        console.log('Missing listen spec or worker endpoint');
+        return -1;
     }
 
     const server = options.server(options);
