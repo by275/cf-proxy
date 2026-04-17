@@ -2,6 +2,7 @@ const DEFAULT_CONNECT_TIMEOUT_MS = 10_000;
 const DEFAULT_IDLE_TIMEOUT_MS = 30_000;
 const DEFAULT_WORKER_COOLDOWN_MS = 30_000;
 const DEFAULT_MAX_CONNECTIONS_PER_WORKER = 32;
+const DEFAULT_MAX_PENDING_BYTES = 1024 * 1024;
 
 const createRequestId = () => crypto.randomUUID();
 
@@ -191,6 +192,10 @@ const clearSocketTimers = (socket) => {
     socket.idleTimeoutId = undefined;
 };
 
+const removeActiveSocket = (options, socket) => {
+    options.activeSockets?.delete(socket);
+};
+
 const closeSocketProxy = (socket, reason, options) => {
     if (socket.proxyClosed)
         return;
@@ -217,6 +222,40 @@ const closeSocketProxy = (socket, reason, options) => {
     }
 
     socket.shutdown();
+};
+
+const queuePendingClientData = (socket, data, options) => {
+    const chunk = Buffer.from(data);
+    socket.pendingClientBytes = (socket.pendingClientBytes ?? 0) + chunk.length;
+
+    if (socket.pendingClientBytes > options.maxPendingBytes) {
+        logEvent(options, socket, 'proxy.error.backpressure', {
+            target: socket.target,
+            pendingBytes: socket.pendingClientBytes,
+            limitBytes: options.maxPendingBytes,
+        });
+        closeSocketProxy(socket, 'pending client buffer exceeded', options);
+        return false;
+    }
+
+    socket.pendingClientData.push(chunk);
+    return true;
+};
+
+const flushPendingClientData = (socket, ws) => {
+    if (socket.pendingClientData.length === 0)
+        return;
+
+    for (const chunk of socket.pendingClientData)
+        ws.send(chunk);
+
+    socket.pendingClientData = [];
+    socket.pendingClientBytes = 0;
+};
+
+const registerSocket = (options, socket) => {
+    options.activeSockets ||= new Set();
+    options.activeSockets.add(socket);
 };
 
 const refreshIdleTimeout = (socket, options) => {
@@ -303,6 +342,11 @@ const maybeRetryConnection = (socket, options, reason, extraFields = {}) => {
 };
 
 const startProxyConnection = async (target, socket, options) => {
+    if (options.shuttingDown) {
+        closeSocketProxy(socket, 'proxy shutting down', options);
+        return null;
+    }
+
     socket.requestId = socket.requestId || createRequestId();
     socket.startedAt = socket.startedAt || Date.now();
     socket.target = target;
@@ -332,6 +376,11 @@ const startProxyConnection = async (target, socket, options) => {
 
     if (socket.proxyClosed)
         return null;
+
+    if (options.shuttingDown) {
+        closeSocketProxy(socket, 'proxy shutting down', options);
+        return null;
+    }
 
     socket.workerSlotOwner = socket.worker;
 
@@ -388,11 +437,7 @@ const startProxyConnection = async (target, socket, options) => {
             socket.pendingForwardData = null;
         }
 
-        if (socket.pendingClientData.length > 0) {
-            for (const chunk of socket.pendingClientData)
-                ws.send(chunk);
-            socket.pendingClientData = [];
-        }
+        flushPendingClientData(socket, ws);
     };
 
     ws.onerror = () => {
@@ -448,8 +493,22 @@ const proxyConnect = (target, socket, options) => {
     socket.triedWorkers = new Set();
     socket.pendingForwardData = null;
     socket.pendingClientData = [];
+    socket.pendingClientBytes = 0;
     startProxyConnection(target, socket, options);
     return null;
+};
+
+const initializeSocket = (socket, options, extra = {}) => {
+    registerSocket(options, socket);
+    socket.requestId = createRequestId();
+    socket.startedAt = Date.now();
+    socket.pendingClientData = [];
+    socket.pendingClientBytes = 0;
+    socket.httpBuffer = Buffer.alloc(0);
+    Object.assign(socket, extra);
+
+    if (options.shuttingDown)
+        socket.shutdown();
 };
 
 const httpServer = (options) => Bun.listen({
@@ -457,11 +516,14 @@ const httpServer = (options) => Bun.listen({
     hostname: '0.0.0.0',
     socket: {
         async open(socket) {
-            socket.requestId = createRequestId();
-            socket.startedAt = Date.now();
-            socket.httpBuffer = Buffer.alloc(0);
+            initializeSocket(socket, options);
         },
         async data(socket, data) {
+            if (options.shuttingDown) {
+                closeSocketProxy(socket, 'proxy shutting down', options);
+                return;
+            }
+
             if (!socket.proxy) {
                 socket.httpBuffer = Buffer.concat([socket.httpBuffer, Buffer.from(data)]);
                 const parsed = parseHttpRequest(socket.httpBuffer);
@@ -488,10 +550,11 @@ const httpServer = (options) => Bun.listen({
                 refreshIdleTimeout(socket, options);
                 socket.proxy.send(data);
             } else if (socket.connecting) {
-                socket.pendingClientData.push(Buffer.from(data));
+                queuePendingClientData(socket, data, options);
             }
         },
         async close(socket) {
+            removeActiveSocket(options, socket);
             closeSocketProxy(socket, 'client socket closed', options);
         }
     }
@@ -502,11 +565,14 @@ const socks5Server = (options) => Bun.listen({
     hostname: '0.0.0.0',
     socket: {
         async open(socket) {
-            socket.step = 0;
-            socket.requestId = createRequestId();
-            socket.startedAt = Date.now();
+            initializeSocket(socket, options, { step: 0 });
         },
         async data(socket, data) {
+            if (options.shuttingDown) {
+                closeSocketProxy(socket, 'proxy shutting down', options);
+                return;
+            }
+
             if (socket.proxy) {
                 refreshIdleTimeout(socket, options);
                 socket.proxy.send(data);
@@ -514,7 +580,7 @@ const socks5Server = (options) => Bun.listen({
             }
 
             if (socket.connecting) {
-                socket.pendingClientData.push(Buffer.from(data));
+                queuePendingClientData(socket, data, options);
                 return;
             }
 
@@ -591,6 +657,7 @@ const socks5Server = (options) => Bun.listen({
             }
         },
         async close(socket) {
+            removeActiveSocket(options, socket);
             closeSocketProxy(socket, 'client socket closed', options);
         }
     }
@@ -640,6 +707,9 @@ const parseOptions = (argv) => {
             case '--max-connections-per-worker':
                 options.maxConnectionsPerWorker = parseInt(argv[++i]);
                 break;
+            case '--max-pending-bytes':
+                options.maxPendingBytes = parseInt(argv[++i]);
+                break;
             case '--json-log':
                 options.jsonLog = true;
                 break;
@@ -680,6 +750,7 @@ function main() {
     options.idleTimeoutMs = getTimeoutMs(options.idleTimeoutMs, DEFAULT_IDLE_TIMEOUT_MS);
     options.workerCooldownMs = getTimeoutMs(options.workerCooldownMs, DEFAULT_WORKER_COOLDOWN_MS);
     options.maxConnectionsPerWorker = getRetryCount(options.maxConnectionsPerWorker, DEFAULT_MAX_CONNECTIONS_PER_WORKER);
+    options.maxPendingBytes = getTimeoutMs(options.maxPendingBytes, DEFAULT_MAX_PENDING_BYTES);
     options.verbosity = options.verbosity ?? 0;
     options.verbose = options.verbosity > 0;
     options.workers = options.workers?.length ? options.workers : options.worker ? [options.worker] : [];
@@ -706,6 +777,7 @@ function main() {
         console.log('--connect-retries     Retry failed worker connects (default: workers-1)');
         console.log('--worker-cooldown-ms  Exclude failed workers for this long (default: 30000)');
         console.log('--max-connections-per-worker  Limit concurrent connects per worker (default: 32)');
+        console.log('--max-pending-bytes   Cap queued client bytes before connect/open (default: 1048576)');
         console.log('--json-log            Emit logs as JSON instead of human-readable text');
         console.log('-v                    Show connect.open and close logs');
         console.log('-vv, --verbose        Show full connection lifecycle logs');
@@ -720,6 +792,23 @@ function main() {
 
     const server = options.server(options);
     console.log(`[+] ${options.type} proxy server listening on ${server.hostname}:${server.port} using ${options.workers.length} worker(s)`);
+
+    const shutdown = (signal) => {
+        if (options.shuttingDown)
+            return;
+
+        options.shuttingDown = true;
+        console.log(`[+] Received ${signal}, shutting down ${options.type} proxy`);
+
+        for (const socket of options.activeSockets ?? [])
+            closeSocketProxy(socket, `shutdown (${signal})`, options);
+
+        if (typeof server.stop === 'function')
+            server.stop();
+    };
+
+    process.on('SIGINT', () => shutdown('SIGINT'));
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
 
     return 0;
 }
