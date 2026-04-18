@@ -5,6 +5,7 @@ const DEFAULT_IDLE_TIMEOUT_MS = 30_000;
 const DEFAULT_WORKER_COOLDOWN_MS = 30_000;
 const DEFAULT_MAX_CONNECTIONS_PER_WORKER = 32;
 const DEFAULT_MAX_PENDING_BYTES = 1024 * 1024;
+const MAX_HTTP_HEADER_BYTES = 16 * 1024;
 
 const createRequestId = () => crypto.randomUUID();
 
@@ -183,6 +184,15 @@ const detectListenerProtocol = (data) => {
         return 'HTTP';
 
     return null;
+};
+
+const formatSocksIpv6 = (bytes) => {
+    const groups = [];
+
+    for (let i = 0; i < 16; i += 2)
+        groups.push(((bytes[i] << 8) | bytes[i + 1]).toString(16));
+
+    return `[${groups.join(':')}]`;
 };
 
 
@@ -502,6 +512,20 @@ const selectWorker = (options, excludedWorkers = new Set(), preferredWorkers = [
         ...preferredWorkers.filter(worker => options.workers.includes(worker)),
         ...options.workers.filter(worker => !preferredWorkers.includes(worker)),
     ];
+
+    for (let i = 0; i < orderedWorkers.length; i++) {
+        const worker = orderedWorkers[(options.workerCursor + i) % orderedWorkers.length];
+        const state = getWorkerState(options, worker);
+
+        if (excludedWorkers.has(worker) || state.cooldownUntil > now)
+            continue;
+
+        if (state.activeConnections >= options.maxConnectionsPerWorker)
+            continue;
+
+        options.workerCursor = (options.workers.indexOf(worker) + 1) % options.workers.length;
+        return worker;
+    }
 
     for (let i = 0; i < orderedWorkers.length; i++) {
         const worker = orderedWorkers[(options.workerCursor + i) % orderedWorkers.length];
@@ -917,6 +941,7 @@ const initializeSocket = (socket, options, extra = {}) => {
     socket.pendingClientData = [];
     socket.pendingClientBytes = 0;
     socket.httpBuffer = Buffer.alloc(0);
+    socket.socksBuffer = Buffer.alloc(0);
     socket.proxyHandshakeSent = false;
     Object.assign(socket, extra);
 
@@ -932,6 +957,17 @@ const handleHttpSocketData = (socket, data, options) => {
 
     if (!socket.proxy) {
         socket.httpBuffer = Buffer.concat([socket.httpBuffer, Buffer.from(data)]);
+
+        if (socket.httpBuffer.length > MAX_HTTP_HEADER_BYTES) {
+            logEvent(options, socket, 'proxy.reject.http_header_too_large', {
+                limitBytes: MAX_HTTP_HEADER_BYTES,
+            });
+            sendProxyFailure(socket, options, 'HTTP/1.1 431 Request Header Fields Too Large\r\n\r\n');
+            closeSocketProxy(socket, 'http header too large', options);
+            socket.httpBuffer = Buffer.alloc(0);
+            return;
+        }
+
         const parsed = parseHttpRequest(socket.httpBuffer);
 
         if (!parsed.complete)
@@ -987,65 +1023,102 @@ const handleSocksSocketData = (socket, data, options) => {
         return;
     }
 
-    switch (socket.step) {
-        case 0:
-            if (data[0] != 0x05) {
-                logEvent(options, socket, 'proxy.reject.socks_version', {});
-                if (options.verbose) console.log('[!] SOCKS version mismatch');
-                socket.shutdown();
-            }
+    socket.socksBuffer = Buffer.concat([socket.socksBuffer, Buffer.from(data)]);
 
-            if (!data.slice(2).includes(0x00)) {
-                logEvent(options, socket, 'proxy.reject.socks_client_error', {});
-                if (options.verbose) console.log('[!] SOCKS client error');
-                socket.shutdown();
-            }
+    while (!socket.proxy && !socket.connecting && !socket.proxyClosed) {
+        switch (socket.step) {
+            case 0: {
+                if (socket.socksBuffer.length < 2)
+                    return;
 
-            socket.write(Buffer.from([0x5, 0x00]));
-            socket.step++;
-            break;
+                const nmethods = socket.socksBuffer[1];
+                const greetingLength = 2 + nmethods;
 
-        case 1:
-            if (data[0] != 0x05 || data[2] != 0x00) {
-                logEvent(options, socket, 'proxy.reject.socks_version', {});
-                if (options.verbose) console.log('[!] SOCKS version mismatch');
-                socket.shutdown();
-            }
+                if (socket.socksBuffer.length < greetingLength)
+                    return;
 
-            if (data[1] != 0x01) {
-                logEvent(options, socket, 'proxy.reject.socks_command', {});
-                if (options.verbose) console.log('[!] Client request could not be satisfied');
-                socket.write(Buffer.from([0x05, 0x07, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]));
-                socket.shutdown();
-            }
+                const greeting = socket.socksBuffer.subarray(0, greetingLength);
+                socket.socksBuffer = socket.socksBuffer.subarray(greetingLength);
 
-            let target = '';
-
-            if (data[3] == 0x1) {
-                target = data.slice(4, 8).map(n => n.toString()).join('.');
-            } else if (data[3] == 0x3) {
-                target = String(Buffer.from(data.slice(5, 5 + data[4])));
-            } else if (data[3] == 0x4) {
-                const ipv6 = Array.from(data.slice(4, 20)).map(b => b.toString(16).padStart(2, 0));
-
-                for (let i = 0; i < ipv6.length; i += 2) {
-                    if (i != 0) target += ':';
-                    target += ipv6.slice(i, i + 2).join('');
+                if (greeting[0] != 0x05) {
+                    logEvent(options, socket, 'proxy.reject.socks_version', {});
+                    if (options.verbose) console.log('[!] SOCKS version mismatch');
+                    socket.shutdown();
+                    return;
                 }
 
-                target = target.replaceAll(':00', ':').replaceAll(':00', ':');
-                target = `[${target.replaceAll(':::', ':')}]`;
-            } else {
-                logEvent(options, socket, 'proxy.reject.socks_address_type', {});
-                if (options.verbose)
-                    console.log('[!] Client request could not be satisfied');
-                socket.shutdown();
+                if (!greeting.subarray(2).includes(0x00)) {
+                    logEvent(options, socket, 'proxy.reject.socks_client_error', {});
+                    if (options.verbose) console.log('[!] SOCKS client error');
+                    socket.shutdown();
+                    return;
+                }
+
+                socket.write(Buffer.from([0x05, 0x00]));
+                socket.step = 1;
+                break;
             }
 
-            const port = data.at(-1) + data.at(-2) * 256;
-            target = `${target}:${port}`;
-            proxyConnect(target, socket, options);
-            break;
+            case 1: {
+                if (socket.socksBuffer.length < 4)
+                    return;
+
+                if (socket.socksBuffer[0] != 0x05 || socket.socksBuffer[2] != 0x00) {
+                    logEvent(options, socket, 'proxy.reject.socks_version', {});
+                    if (options.verbose) console.log('[!] SOCKS version mismatch');
+                    socket.shutdown();
+                    return;
+                }
+
+                if (socket.socksBuffer[1] != 0x01) {
+                    logEvent(options, socket, 'proxy.reject.socks_command', {});
+                    if (options.verbose) console.log('[!] Client request could not be satisfied');
+                    socket.write(Buffer.from([0x05, 0x07, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]));
+                    socket.shutdown();
+                    return;
+                }
+
+                const atyp = socket.socksBuffer[3];
+                let requestLength = 0;
+
+                if (atyp === 0x01)
+                    requestLength = 10;
+                else if (atyp === 0x03) {
+                    if (socket.socksBuffer.length < 5)
+                        return;
+                    requestLength = 7 + socket.socksBuffer[4];
+                } else if (atyp === 0x04)
+                    requestLength = 22;
+                else {
+                    logEvent(options, socket, 'proxy.reject.socks_address_type', {});
+                    if (options.verbose) console.log('[!] Client request could not be satisfied');
+                    socket.shutdown();
+                    return;
+                }
+
+                if (socket.socksBuffer.length < requestLength)
+                    return;
+
+                const request = socket.socksBuffer.subarray(0, requestLength);
+                socket.socksBuffer = socket.socksBuffer.subarray(requestLength);
+
+                let target = '';
+
+                if (request[3] == 0x01) {
+                    target = request.slice(4, 8).map(n => n.toString()).join('.');
+                } else if (request[3] == 0x03) {
+                    target = String(Buffer.from(request.slice(5, 5 + request[4])));
+                } else if (request[3] == 0x04) {
+                    target = formatSocksIpv6(request.slice(4, 20));
+                }
+
+                const portOffset = requestLength - 2;
+                const port = request[portOffset] * 256 + request[portOffset + 1];
+                target = `${target}:${port}`;
+                proxyConnect(target, socket, options);
+                return;
+            }
+        }
     }
 };
 
