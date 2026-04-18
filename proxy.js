@@ -32,8 +32,7 @@ const formatTextLog = (level, event, fields) => {
         fields.ts,
         fields.req,
         event.padEnd(15, ' '),
-        `worker=${fields.worker ?? '-'}`,
-        `target=${fields.target ?? '-'}`,
+        `${fields.worker ?? '-'} -> ${fields.target ?? '-'}`,
     ];
     const extras = Object.entries(fields)
         .filter(([key, value]) => !['ts', 'req', 'event', 'worker', 'target'].includes(key) && value !== undefined)
@@ -60,6 +59,18 @@ const shouldPrintCloseReason = (reason = '') => {
         return false;
 
     if (reason.startsWith('shutdown '))
+        return false;
+
+    if (reason.startsWith('idle timeout after '))
+        return false;
+
+    if (reason === 'no worker available')
+        return false;
+
+    if (/^worker websocket closed \(\d+\)$/.test(reason))
+        return false;
+
+    if (reason === 'worker websocket error')
         return false;
 
     return true;
